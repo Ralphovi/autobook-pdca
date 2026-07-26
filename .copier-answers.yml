@@ -1,0 +1,26 @@
+# Records the template version and your answers so `copier update` can re-apply
+# harness updates. Managed by Copier — do not edit by hand; commit it to your repo.
+_commit: v0.55.0
+_src_path: gh:eduralph/pdca-harness
+author_email: eduard@ralphovi.net
+author_name: Eduard Ralph
+builder_family: claude
+bundle_root: results
+cli_name: pdca-autobook
+contribution_model: own-repo
+default_branch: main
+gates_runner: ./engine/nox.sh
+interactive_family: claude
+issue_id_example: '#123'
+leaves_mode: stub
+process_dir: process
+project_description: PDCA quality-cycle wrapping Autobook's nox gates
+project_license: Apache-2.0
+project_name: Autobook PDCA
+project_slug: autobook-pdca
+reviewer_family: codex
+ship_ci_workflow: false
+ship_merge_guard: true
+tracker_system: github
+tracker_url: https://github.com/Ralphovi/autobook
+

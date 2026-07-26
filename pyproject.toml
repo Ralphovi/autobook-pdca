@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autobook-pdca-pdca-harness"
+version = "0.1.0"
+description = "PDCA quality-cycle harness for Autobook PDCA"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Eduard Ralph", email = "eduard@ralphovi.net" }]
+dependencies = []
+
+[project.scripts]
+pdca-autobook = "pdca_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

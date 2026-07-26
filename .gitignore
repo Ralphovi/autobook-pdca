@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Claude — machine-local permissions/paths, never publish (any depth, incl. bundles)
+settings.local.json
+**/.claude/settings.local.json
+
+# Runtime / generated artifacts (regenerable)
+.rehearse/
+results/issue_selftest/
+*.log
+
+# Act frontier lock/temp sidecars (issue #299) — runtime-only serialization helpers;
+# the marker itself (process/.act-reviewed) stays tracked.
+.act-reviewed.lock
+.act-reviewed.tmp.*
+.act-session.lock
+
+# Per-cycle Do/Check worktrees (issue #94) — created next to the target checkout;
+# ignored in case a checkout lives inside the project tree.
+*.pdca-wt/
+*.pdca-wt-l*/
+
+# ---------------------------------------------------------------------------
+# Autobook-specific. Bundles and briefs are free text that gets committed, and
+# this project's subject matter is bank statements. Never let statement or book
+# files reach a bundle — a brief quoting a real memo is a data leak with a git
+# history. The rule is in docs/INTEGRATION.md §3; this is the backstop.
+# ---------------------------------------------------------------------------
+*.gnucash
+*.gnucash.*
+*.qif
+*.ofx
+*.qfx
+*.mt940
+*.sta
+*.camt*.xml
