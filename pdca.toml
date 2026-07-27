@@ -27,7 +27,7 @@ templates_dir = "templates"
 # only N copies, not one per bundle. Leave at 1 unless per-lane disk / sign-off
 # ergonomics actually bite (then prefer this over N separate workspaces).
 [driver]
-lanes = 1
+lanes = 3
 # Sign-off pass budget for one `pdca flow` run (issue #260): how many build-all → sign-off
 # passes a wave gets (and how many iterations a single issue gets) before the driver stops
 # driving it. A hard bundle can legitimately need many sign-off iterations; when the budget
@@ -56,7 +56,7 @@ max_passes = 20
 # It NEVER auto-accepts and never ticks a §6 box.
 # Bounded by `max_auto_iters` rounds per bundle (clamped below max_passes); on exhaustion the
 # bundle halts for you as before. `PDCA_AUTO_ITERATE=1` / `--auto-iterate` override.
-auto_iterate = false
+auto_iterate = true
 max_auto_iters = 3
 # Worktree isolation (issue #94). A cycle's Do/Check run in a dedicated git worktree off
 # the target's base, so the host's primary checkout is NEVER mutated in place. The harness
@@ -79,7 +79,7 @@ worktree = true
 # unless you actually run out-of-band gate/verify reads against in-flight lanes (the common
 # serial / one-bundle-per-lane flow never contends, so 0 costs nothing). Each overflow is a
 # full checkout — size the cap to your disk headroom; spillover is logged when it happens.
-overflow = 0
+overflow = 1
 # Per-lane resource preflight (issue #213). A `lanes > 1` batch pins each bundle to a lane
 # slot and exports `$PDCA_LANE`; the instance's gate commands map that to a per-lane resource
 # (a worktree, a container, a port). This verifies those resources exist ONCE, before the
@@ -223,6 +223,22 @@ issue_url_pattern = ""
 # type = "command"           # exactly today's notes_cmd, but one of several sources
 # cmd = "./engine/scripts/scrape-notes.sh {id}"
 
+# ACTIVE — the GitHub issue thread IS Autobook's tracker record. The build-order issues
+# carry most of their design intent in the body and comments (they cite proposal 0001 by
+# section), and the plan-advisory lens explicitly checks for "ignored tracker context" —
+# which it cannot do if the thread was never fetched. `role = "tracker"` makes this the
+# canonical fetch: it writes notes.json itself and suppresses `notes_cmd` (unset here, so
+# nothing collides), sourcing the issue once rather than storing it twice.
+#
+# `repo` is set explicitly rather than left to gh's default. It is optional for the SEED,
+# which runs from the project root — but the reopen probe (`tracker_issue_reopened`) must
+# never guess: gh's checkout-default repository could hold a wrong same-numbered issue, and
+# a wrong OPEN there would clear a genuine resolution.
+[[plan.source]]
+type = "github"
+role = "tracker"
+repo = "Ralphovi/autobook"
+
 # Publish mechanics — `pdca publish` and the flow's publish-on-accept (docs 03 §Check
 # closing step). Branch patterns are `{id}` / `{slug}` format strings; the
 # repo→checkout map falls back to the sibling convention (`<project>/../<repo-last-
@@ -248,13 +264,62 @@ base_remote = "origin"
 # Headless leaves ----------------------------------------------------------------
 # Do builder — writes patch.diff + test + build-notes.md:
 [leaves.builder]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = false
 # Role prompt: canonical body agents/builder.md. Claude resolves it via the baked
 # `--agent builder`; codex (no agent flag) has it inlined into the prompt.
 agent = "builder"
+# Attempt 1 runs sonnet; the escalation ladder below takes over from attempt 2. Do is the
+# bulk consumer here — it reruns under [driver].auto_iterate (up to max_auto_iters rounds)
+# across 3 lanes — so this is the one leaf where a cheap first pass is worth having.
+# `model`/`effort` are mapped through the family profile onto --model/--effort; they apply
+# because argv names neither (an explicit flag in argv always wins).
+model = "sonnet"
+effort = "high"
 argv = ["claude", "-p", "--agent", "builder", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
+
+# ACTIVE — escalate from attempt 2. Without a ladder an iterated bundle re-runs the SAME
+# model and tends to re-fail the same way until you discontinue it. Inherits every field it
+# omits from [leaves.builder], so only the delta is declared here. Which backend ran each
+# pass, and iterations-to-pass, land in the bundle's loop-telemetry.json — read that before
+# deciding whether sonnet-first is earning its keep.
+#
+# THE LADDER IS INDEPENDENT OF auto_iterate, by construction and deliberately. It keys on
+# `attempt_no` — the count of `iteration-v*` archives + 1 — and that archive is written by the
+# driver's ITERATE_DO state handler, which is reached identically whether auto-iterate
+# recorded the decision or YOU did at sign-off. So escalation measures ONE thing: how many
+# times this bundle has failed Check. It does not know, and must not care, what drove the
+# rebuild. Turning auto_iterate off, or changing max_auto_iters, does not move a single rung.
+#
+# THE CLI MODEL GOES IN argv HERE, not in a `model` key. In an escalation/variant spec
+# `model` is the issue-#167 SELECTOR name a brief pins via `- **Do model:** <name>`, and
+# `_leaf_from_spec` deliberately inherits the profile-mapped CLI model from [leaves.builder]
+# instead (`model=default.model`). A `model = "opus"` key here would therefore be read as a
+# selector, silently leave attempt 2 on the builder's sonnet, and the ladder would do
+# nothing — a green-looking config that never escalates. `effort` IS read from the spec.
+[[leaves.builder_escalation]]
+min_iteration = 2
+effort = "high"
+argv = ["claude", "-p", "--agent", "builder", "--model", "opus", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
+
+# Top rung — opus at MAX effort from attempt 4. The threshold is stated in the ladder's own
+# terms: a bundle reaching attempt 4 has failed Check THREE times, twice of them already on
+# opus/high. It is therefore not failing for want of reasoning budget at that tier, and the
+# alternative to spending more is a bundle nobody solved. Rare by construction.
+#
+# Deliberately NOT expressed as "the last unattended attempt". That would peg this rung to
+# max_auto_iters and make it dead config the moment auto-iterate is turned off or its budget
+# lowered — when in fact a human's iterate-do reaches attempt 4 and beyond just the same.
+# Change max_auto_iters freely; this rung is unaffected.
+#
+# `select_builder` takes the entry with the HIGHEST min_iteration <= the attempt, so the two
+# rungs compose regardless of declaration order. Same rule as above — the CLI model lives in
+# argv; only `effort` is read from the spec.
+[[leaves.builder_escalation]]
+min_iteration = 4
+effort = "max"
+argv = ["claude", "-p", "--agent", "builder", "--model", "opus", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
 
 # Builder escalation ladder (issue #135) — optional. A bundle that fails Check and
 # iterates re-runs the builder; without escalation it re-fails with the same model until
@@ -287,12 +352,18 @@ argv = ["claude", "-p", "--agent", "builder", "--permission-mode", "acceptEdits"
 # (INTEGRATION §4). `--agent reviewer` (same family as the builder) is the
 # documented FALLBACK only; it weakens the independence Check relies on.
 [leaves.reviewer]
-mode = "stub"
+mode = "command"
 family = "codex"
 interactive = false
 # Role prompt: canonical body agents/reviewer.md, inlined for codex / resolved via
 # `--agent reviewer` for claude. (AGENTS.md now carries general codex project context.)
 agent = "reviewer"
+# STAYS CODEX. Cross-vendor decorrelation is the only independent read Check gets on the
+# builder's evidence, and with the adversary on claude, Check spans both vendors. Effort is
+# pinned because an under-reasoning reviewer rubber-stamps — the failure mode is a PASS, not
+# a visible error. Mapped through the codex profile to `-c model_reasoning_effort=high`;
+# `model` is left unset so it follows the codex account default.
+effort = "high"
 # `codex exec --sandbox workspace-write` — the reviewer re-runs red/green evidence
 # (git stash/unstash) and re-checks path:line on $PDCA_TARGET, which the driver grants as a
 # writable root via the family's --add-dir grounding. The role prompt forbids writing the FIX.
@@ -307,21 +378,29 @@ argv = ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check"
 # with the role prompt (agents/<name>.md) inlined via the `agent` key. Independent of the
 # builder/reviewer family above.
 [leaves.planner]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "planner"
+# THE HIGHEST-LEVERAGE LEAF, and the cheapest place to buy capability: one interactive call
+# per issue, against a Do that may rerun four times across three lanes. It is also the only
+# leaf whose error no downstream gate can recover — docs/principles.md §3/§4: a success
+# criterion narrow enough to be met by guarding one module lets the wrong fix pass Check,
+# and no gate can reconstruct the right invariant from a wrong one. So it gets the strongest
+# model at high effort while the builder starts on sonnet.
+model = "opus"
+effort = "high"
 argv = ["claude", "--agent", "planner", "--permission-mode", "acceptEdits"]
 
 [leaves.signoff]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "signoff"
 argv = ["claude", "--agent", "signoff", "--permission-mode", "acceptEdits"]
 
 [leaves.act]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "act"
@@ -331,27 +410,16 @@ argv = ["claude", "--agent", "act", "--permission-mode", "acceptEdits"]
 # git/draft-PR mechanics are deterministic code in pdca_harness.publish). A non-claude
 # publisher gets the driver's `gh` STOP-shim (guard.py) since it has no PreToolUse hook.
 [leaves.publisher]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "publisher"
 argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 
 
-# FAMILY PROFILES (vendor neutrality). Every vendor-CLI-specific behavior is DATA
-# (pdca_harness.families): how to stream, how to grant an extra read dir, how a role
-# prompt is injected, whether the CLI must run from the harness root, whether it has
-# its own STOP-discipline hook. Built-ins ship for claude / codex / gemini / generic;
-# any UNKNOWN family name falls back to generic (prompt on stdin, no vendor flags),
-# and a non-claude BUILDER automatically gets the driver's `gh` PATH-shim guard —
-# the same builder_guard.py rules as claude's PreToolUse hook, vendor-neutrally.
-# Override or extend per instance; adding a vendor is config, not a driver change:
-# [families.mycli]
-# grounding_flag = "--include-directories"   # "" ⇒ env-only ($PDCA_TARGET/$PDCA_WORKTREE)
-# role_injection = "inline"                  # "flag" | "inline" | "none"
-# stream_argv = []                           # flags for a live tool-use stream, if any
-# cwd_discovery = false                      # true ⇒ run from harness root (claude-style)
-# native_guard = false                       # true ⇒ skip the driver's gh PATH shim
+# Family profiles are DATA (pdca_harness.families); built-ins ship for claude / codex /
+# gemini / generic, and an unknown family falls back to generic.
+#
 #
 # Any leaf may also carry, mapped through its family's profile (explicit argv wins):
 #   agent  = "reviewer"   # role prompt: canonical body is agents/<name>.md. Claude passes
@@ -361,15 +429,6 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 #   model  = "<id>"       # → the profile's model_flag (claude --model, codex/gemini -m)
 #   effort = "high"       # → the profile's effort_argv mapping
 #
-# Example: a Gemini CLI advisory reviewer (grounded via --include-directories, role
-# prompt inlined — no claude machinery needed):
-# [[leaves.advisory]]
-# id = "gemini"
-# role = "correctness bugs introduced by the patch"
-# mode = "command"
-# family = "gemini"
-# agent = "code-review"
-# argv = ["gemini", "--yolo"]
 
 # Optional advisory reviewer leaves (issue #64) — an OPEN list. The `reviewer` leaf above
 # judges fix ADEQUACY (causal adequacy, scope, validation); add role-distinct ADVISORY
@@ -398,7 +457,54 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # family = "claude"
 # argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
 # when = { field = "difficulty", substring = "high" }
+
+# ACTIVE — the adversarial Check leaf for Autobook.
 #
+# Why this project has one at all: Autobook writes to people's books, and its
+# characteristic failure is a SILENT one — a fix that looks green because the evidence
+# is hollow (a test that would pass without the fix, a fixture curated around the
+# failing case). That is exactly what this leaf is built to refute, and it matters more
+# here now that [driver].auto_iterate is on: the driver rebuilds unattended on
+# implementation-only findings, so a plausible-but-wrong fix can otherwise iterate its
+# way to green with no human ever looking at the evidence.
+#
+# FAMILY = CLAUDE. Perfect decorrelation is not available with two CLIs installed: the
+# builder is claude and the reviewer is already codex, so an adversary must share a
+# vendor with one of them. This one is independent of the REVIEWER (codex) whose verdict
+# it re-opens, and shares a vendor with the builder whose evidence it refutes. Know the
+# cost of that half: same-vendor blind spots in the red→green evidence are the ones it is
+# least likely to catch, so a hollow test claude found convincing to write, claude may
+# find convincing to read. The role prompt is the counterweight — the adversary defaults
+# to "refuted" when uncertain, which is a different disposition, not a different model.
+# Two claude-family properties also favour it here: `--agent adversary` resolves the role
+# prompt natively, and only a claude leaf can be given a BOUNDED sandbox by the harness
+# ([leaves.sandbox] — codex gets an all-or-nothing network grant), which matters if a
+# Docker-backed gate ever lands.
+#
+# To decorrelate automatically instead, declare a second entry with `family = "codex"`
+# and the same `role`, then set [leaves.advisory_selection] mode = "vendor-complement"
+# below — the driver then runs whichever entry differs from the builder that ACTUALLY
+# ran, which also holds if a difficulty-routed or escalated builder changes vendor.
+#
+# Gated to high-difficulty bundles (the planner's blast-radius signal) — enforcement is
+# rationed, per docs/principles.md §8. Drop the `when` line to run it on every bundle.
+# Advisory always: it never gates, and its findings land as §6 NEEDS-HUMAN items.
+# Read-only tool grant: it must be able to RUN the evidence, never to rewrite the fix.
+[[leaves.advisory]]
+id = "adversary"
+role = "refute the red→green evidence and the reviewer's verdict; find the input that breaks the fix"
+mode = "command"
+family = "claude"
+agent = "adversary"
+# Strongest model, and affordable because the `when` clause makes it rare: it runs only on
+# high-difficulty bundles. Refuting is harder than reviewing — it must construct the input
+# that breaks a fix two other models already signed off on — so this is the wrong leaf to
+# economise, and it is also the last line before auto_iterate rebuilds unattended.
+model = "opus"
+effort = "high"
+argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
+when = { field = "difficulty", substring = "high" }
+
 # Advisory-selection policy (issue #64 default vs. issue #200). Unset ⇒ every advisory leaf
 # above whose `when` matches runs. Opt into `vendor-complement` to make cross-vendor
 # decorrelation (INTEGRATION §4) automatic: the driver treats the [[leaves.advisory]] list
@@ -438,98 +544,17 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # [leaves.plan_advisory_selection]
 # mode = "vendor-complement"   # anchor: the PLANNER family (the brief's author)
 
-# Sandbox exemptions for the Check leaves (issue #276). The reviewer / advisory leaves run
-# under Claude Code's sandbox, which denies the DOCKER SOCKET. So a conformance gate that
-# brings up a live cluster (`docker compose` → etcd / TiKV / FDB) is permission-denied inside
-# the leaf EVEN ON A DOCKER-CAPABLE HOST: the runtime leg skips, its evidence can never be
-# earned at Check, and it defers to a human-run confirmer on every bundle — the process turns
-# burdensome exactly where it should be mechanical.
-#
-# List those commands here and ONLY THEY run outside the sandbox. Every other Bash line the
-# leaf writes stays fully confined. This is deliberately NOT a socket-wide grant: opening all
-# unix sockets would let ANY command the leaf runs reach the docker daemon, and a root-owned
-# daemon (the common setup — check `ls -l /var/run/docker.sock`) is effectively root on the
-# host. Name the command; don't open the socket.
-#
-# Match the command you actually gate on, as precisely as you can — this is a capability, so
-# a loose pattern (`docker *`) hands the leaf far more than a specific one.
-#
-# "ONLY THEY" is ENFORCED, not merely intended — it takes three things, because a list of names
-# on its own bounds nothing:
-#   0. There must BE a sandbox. `sandbox.enabled` defaults to FALSE, and (2) below drops your
-#      user-scope settings — where an operator's `enabled = true` normally lives — so without
-#      seeding it, bounding the exemption would REMOVE the sandbox it claims to bound, and
-#      EVERY command would escape. Nor does the sandbox fail closed on its own: with its
-#      dependencies (bubblewrap, socat) missing it DISABLES itself, warns, and runs everything
-#      unconfined. So the harness seeds `enabled = true` AND `failIfUnavailable = true` (which
-#      only has effect when enabled is true), and the leaf REFUSES to start rather than run
-#      unconfined. `pdca doctor` checks those dependencies before a run (required rows) — run it.
-#   1. The harness seeds `allowUnsandboxedCommands = false` beside the list. Claude Code
-#      defaults it to TRUE, and while true the model may retry ANY sandbox-denied command with
-#      `dangerouslyDisableSandbox` and have it run unconfined.
-#   2. The leaf runs with `--setting-sources project`, so it loads ONLY the settings the
-#      harness seeds. Array settings CONCATENATE across scopes, and the union is monotonic —
-#      nothing can remove what a lower scope added — so YOUR OWN `~/.claude/settings.json`
-#      `excludedCommands` (your interactive exemptions) would otherwise merge straight into the
-#      leaf, and this list would be a floor rather than a ceiling.
-#
-# THE ONE SCOPE THE HARNESS CANNOT BOUND: enterprise managed policy. `--setting-sources` excludes
-# user and local settings, but Claude Code ALWAYS loads `managed-settings.json` regardless — and
-# arrays only ever concatenate. So a managed policy carrying `sandbox.excludedCommands` widens the
-# leaf's exemption and NOTHING the harness can do will narrow it. The list is a ceiling with
-# respect to YOUR settings, not your ORGANISATION's. If your org sets one, read it before relying
-# on this boundary.
-#
-# The cost of (2): the leaf no longer reads your user-scope settings at all. If your AUTH lives
-# there (`apiKeyHelper`, or `env.ANTHROPIC_API_KEY`), move it into the environment or the leaf
-# will fail to start. It fails loudly, and the error lands in the bundle's `*.error.log`.
-#
-# Claude-family leaves only: codex does not read the settings the harness seeds, so it can be
-# given neither a per-command exemption nor the confinement that bounds one. The harness REFUSES
-# this key there rather than hand out an unbounded grant — use `network_access` below instead.
-#
-# HARDENING: a rootless daemon (podman, or rootless dockerd) makes socket access user-level
-# rather than root-level, which de-fangs the whole class of risk. Prefer it where you can.
-#
-# Empty (the default) ⇒ no exemptions; the leaf is fully sandboxed and a Docker-backed leg
-# will skip and defer to a human (today's behaviour).
-#
-# BOTH sandbox keys live under the ONE `[leaves.sandbox]` table below — see `network_access`,
-# documented next. They are independent opt-ins, but TOML forbids declaring the same table
-# twice, so uncomment the header ONCE and put both keys under it.
 
-# `network_access` — the CODEX-shaped grant, and the only way a codex leaf reaches Docker.
-#
-# codex's `--sandbox workspace-write` has no per-command escape, and its refusal of the docker
-# socket is NOT a filesystem denial: a relayed socket in a directory codex can write is refused
-# just the same. It is the seccomp/network layer. So no path grant fixes it — only opening that
-# layer does. It also reaches api.github.com, settling the reviewer's prior-art check (#277).
-#
-# THE TWO GRANTS HAVE DIFFERENT SHAPES, and neither is strictly tighter — which is exactly why
-# this is a SEPARATE key. Naming a command never implies the network grant:
-#
-#   claude  unsandboxed_commands  a NAMED command leaves the sandbox entirely (filesystem too);
-#                                 every other command stays confined.
-#   codex   network_access        the SOCKET/NETWORK layer opens for EVERY command in the leaf
-#                                 (no per-domain scoping); the FILESYSTEM stays confined for
-#                                 every command.
-#
-# `unsandboxed_commands` promises "ONLY THEY run outside the sandbox" — a promise this grant
-# would not keep, since it frees the network for every command the leaf writes. So opt into each
-# one deliberately. Both are moot against a ROOT-OWNED daemon: anything that can talk to that
-# socket can start a container with `-v /:/host`, so codex's retained filesystem confinement
-# buys little there. Rootless is the real answer for either family.
-#
-# false (the default) ⇒ the codex leaf's network stays closed; a Docker-backed leg skips and
-# defers to a human (today's behaviour).
-#
-# ONE table, BOTH keys — uncomment only the lines you need. A second `[leaves.sandbox]` header
-# makes tomllib refuse the file ("Cannot declare ('leaves','sandbox') twice") and the driver
-# will not start at all (PR #292 review). Also note `network_access` must be the UNQUOTED
-# boolean `true`; a quoted "true"/"false" is rejected and the grant stays closed.
+# Leaf sandbox exemptions (issue #276) — NOT used here, and the long rationale was pruned
+# with the other dead-feature docs. The EXAMPLE stays because it is a shipped-template
+# contract (tests/test_families.py pins it): it must appear exactly once and still parse when
+# uncommented. It would matter only if a gate needed a sandboxed leaf to reach the Docker
+# socket; Autobook's gate is nox, with no such leg. Both keys go under the ONE table — a
+# second [leaves.sandbox] header makes tomllib refuse the whole file and the driver will not
+# start — and `network_access` must be an UNQUOTED boolean.
 # [leaves.sandbox]
-# unsandboxed_commands = ["cargo xtask fdb-conformance", "cargo xtask etcd-conformance"]  # claude
-# network_access = true                                                                    # codex
+# unsandboxed_commands = ["cargo xtask fdb-conformance"]  # claude: ONLY these leave the sandbox
+# network_access = true                                   # codex: opens the network for the leaf
 
 # Doctor rows (`pdca doctor`) — optional. The doctor derives its main checks from
 # this file (every command leaf's CLI + auth, gh, bundle root, notes_cmd); declare
@@ -538,8 +563,6 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # The built-in workspace section also WARNs when free disk space under the project root
 # drops below [doctor].min_free_gb GiB (issue #297 — quota exhaustion mid-gate produces
 # an arbitrary failing test name, misattributed to the patch). 0 disables the row.
-# [doctor]
-# min_free_gb = 10.0
 # Each cmd runs from the project root; exit 0 = OK. Fields:
 #   group     optional section header the row prints under (e.g. "engine")
 #   level     status when the cmd FAILS — "WARN" for optional, default "MISSING"
@@ -547,6 +570,7 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 #   per_lane  expand the row once per [driver].lane: {lane} → 0..lanes-1,
 #             {lanes} → the count (nothing when lanes ≤ 1). {lanes} substitutes
 #             in every row, so a hint can read "make worktrees LANES={lanes}".
+# Example of each shape (the live rows for this instance follow):
 # [[doctor.checks]]
 # group = "engine"
 # id = "docker"
@@ -561,6 +585,104 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # per_lane = true
 # level = "WARN"
 
+[doctor]
+# The harness's own footprint here is small — a handful of nox virtualenvs per lane
+# worktree, not a multi-GB build tree — so the default threshold is ample headroom
+# rather than a tight fit. Kept explicit because [driver].lanes x .nox scales it.
+min_free_gb = 10.0
+
+# ---------------------------------------------------------------------------
+# Autobook's gate toolchain.
+#
+# The whole delegated gate is `./engine/nox.sh gate` → `cd <autobook checkout> &&
+# nox -s gate`. Everything below is a prerequisite of THAT command. Autobook's
+# noxfile.py stays the single source of gate truth; these rows only assert that the
+# machine can run it — they re-declare no gate.
+#
+# Note what is deliberately NOT here: ruff, mypy, pytest. `nox` builds a fresh
+# virtualenv per session and pip-installs pinned versions itself, so they are never
+# a machine dependency. The network they need IS one — see the PyPI row.
+#
+# EVERY `id` BELOW IS A BARE TOKEN, and must stay one. `doctor.registered_ids` is
+# exact set membership: a brief's `External dependencies` field names a dependency as
+# a backticked token equal to a row's id (`typos` ↔ id = "typos"), and an unmatched
+# token becomes a §6 item that BLOCKS accept (#263). A descriptive id like
+# "typos (spell gate)" registers nothing a brief can name, so it would manufacture a
+# false blocker on a correctly-written brief. Put the description in `hint` — which
+# is what prints when the row fails — never in `id`.
+# ---------------------------------------------------------------------------
+
+[[doctor.checks]]
+group = "autobook gate toolchain"
+id = "nox"
+cmd = "command -v nox"
+hint = "pipx install nox — engine/nox.sh delegates every gate to it and has no fallback (it exits 2)"
+required = true
+
+[[doctor.checks]]
+group = "autobook gate toolchain"
+id = "autobook-checkout"
+cmd = 'test -f "${AUTOBOOK_REPO:-../autobook}/noxfile.py"'
+hint = "clone Ralphovi/autobook as a sibling ../autobook, or set $AUTOBOOK_REPO — engine/nox.sh resolves $PDCA_WORKTREE, then $AUTOBOOK_REPO, then ../autobook"
+required = true
+
+# THE FALSE-GREEN ROW. `nox -s typos` uses venv_backend="none" and, when `typos` is
+# absent, warns and RETURNS — the session passes, so `nox -s gate` exits 0 having
+# spell-checked nothing. CI installs typos unconditionally (ci.yml pins v1.48.0) and
+# always runs it. So a missing binary does not fail a bundle here; it makes C4-ci go
+# GREEN on a patch CI will then reject, which is exactly the "never report a skipped
+# step as having run" rule in Autobook's AGENTS.md. Required for that reason: the
+# damage is a silent pass, not a loud failure.
+[[doctor.checks]]
+group = "autobook gate toolchain"
+id = "typos"
+cmd = "command -v typos"
+hint = "cargo install typos-cli --locked (or a distro package) — without it `nox -s gate` still exits 0 with the spell gate un-run, while CI runs it and fails the PR"
+required = true
+
+# The gate refuses to run outside noxfile.py's PYTHONS range (session.error), and it
+# runs on whatever interpreter NOX itself is installed under — not necessarily the
+# `python3` on PATH. Resolve nox's interpreter from its shebang and check that one,
+# falling back to python3 when the shebang is unreadable.
+[[doctor.checks]]
+group = "autobook gate toolchain"
+id = "nox-interpreter"
+cmd = '''py=$(sed -n '1s|^#!||p' "$(command -v nox)" 2>/dev/null); "${py:-python3}" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] <= (3,14) else 1)' '''
+hint = "reinstall nox on a supported interpreter — `nox -s gate` calls session.error() outside noxfile.py's PYTHONS range, so every bundle in the wave fails identically"
+level = "WARN"
+
+# Needed on EVERY gate read, not just a cold start. `worktree.rebuild_for_gate` reconstructs
+# the lane as base + patch.diff with `git clean -ffdxq` — the `-x` removes IGNORED files, so
+# `.nox` is destroyed before each gate and all four session venvs are rebuilt (measured:
+# ~8s cold vs ~3s warm, since pip's wheel cache lives in $HOME and survives the clean).
+# The rebuild still resolves against the index for the unpinned `pytest>=8` / `pytest-cov>=5`,
+# so an offline host fails EVERY gate inside pip, attributed to the bundle rather than the
+# machine. The lane is a warm CHECKOUT cache, never a warm BUILD cache.
+[[doctor.checks]]
+group = "autobook gate toolchain"
+id = "pypi"
+cmd = "python3 -c \"import urllib.request as u; u.urlopen('https://pypi.org/simple/', timeout=5)\""
+hint = "every gate read rebuilds .nox from scratch (the lane clean is `-x`); offline, every gate fails inside pip and looks like a bad patch"
+level = "WARN"
+
+# ---------------------------------------------------------------------------
+# Autobook's applier — NOT a gate, and deliberately unreachable as one.
+#
+# `nox -s applier` is the only session granted --system-site-packages, because
+# python3-gnucash lives in dist-packages and cannot be pip-installed. engine/nox.sh
+# refuses to expose it: it writes to a book, and by Autobook's rules runs against a
+# restored copy, attended, never by a driver. This row is a heads-up for the human's
+# own local runs (build order step 5), never a precondition of a PDCA cycle — hence
+# WARN and not required. It probes the SYSTEM python3, which is what that session sees.
+# ---------------------------------------------------------------------------
+
+[[doctor.checks]]
+group = "autobook applier (never a PDCA gate)"
+id = "python3-gnucash"
+cmd = "python3 -c 'import gnucash'"
+hint = "sudo apt install python3-gnucash — needed only for a local `nox -s applier`; no PDCA gate can reach it (see engine/nox.sh)"
+level = "WARN"
+
 # Deterministic Check gates (docs 04). Each check runs a shell command; it PASSES
 # iff the command exits 0. `scope = "repo"` runs against the working tree (and is
 # what CI re-runs via `pdca gates --working-tree`); `scope = "bundle"` needs the
@@ -570,26 +692,6 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # the isolated tree Do edited; a bundle-scoped gate should test THAT, not the host
 # checkout (e.g. `cd "$PDCA_WORKTREE" && <run the test>`).
 #
-# TARGET-AWARE SELECTION (optional). A check may carry `target` — a label or a LIST;
-# it runs iff its labels are a SUBSET of the bundle's label set (subset = AND). The
-# bundle is classified from its brief on two axes:
-#   * PRIMARY (mutually exclusive, e.g. core vs addon): `[gates.target_match]` maps a
-#     label → substring matched (case-insensitively) against "Repo + branch target",
-#     `target_default` is used when none match.
-#   * FLAGS (additive, e.g. frontend): `[gates.target_flags]` maps a label →
-#     {field, substring} matched against ANY brief field (a bare string ⇒ the
-#     "Repo + branch target" field).
-# Unset ⇒ no filtering (every gate runs). E.g. skip core suites on an addon-only fix,
-# and run a GUI/E2E gate only for a *frontend* change (core OR addon):
-#   [gates]
-#   target_default = "core"
-#   [gates.target_match]
-#   addon = "addons-source"
-#   [gates.target_flags]
-#   frontend = { field = "surfaces", substring = "gui" }
-# then tag gates: core suite `target = "core"`, addon suite `target = "addon"`, GUI
-# smoke `target = "frontend"`, an addon-in-GUI E2E `target = ["addon", "frontend"]`.
-# `pdca gates --working-tree` (no bundle) is never filtered, so the CI re-gate is unaffected.
 #
 # While `checks` is empty the driver uses built-in all-PASS stubs so the offline
 # slice runs. Fill these in as your gate tiers get written (gates are the long
@@ -669,27 +771,3 @@ checks = [
   # the way wyrd-pdca's C4-verify does.
   # { id = "C4-verify", tier = "C4", label = "per-fix red->green", cmd = "./engine/scripts/run-verify.sh", gating = false, scope = "bundle", promote_after = 3 },
 ]
-
-
-# Reverse registry-consistency (issue #205). The FORWARD direction (a source file a patch
-# adds must be registered in a manifest) is a project gate; this is the REVERSE, generic in
-# the harness: every line a patch ADDS to one of these manifest files must reference a path
-# the SAME patch touches. A registry line pointing at a file the patch never touches is
-# cross-bundle / build-tree contamination — the stored patch then fails to apply to its clean
-# publish base, yet passes Check. Name your manifest files here and wire the bundle-scoped
-# `registry-check` gate below; `pattern` (optional) is a regex whose first group extracts the
-# path from a non-bare-path manifest line (e.g. "^include (.+)$" for a MANIFEST.in) — omit for
-# bare-path manifests like POTFILES (the whole line is the path; blank / `#` lines ignored).
-# [gates.registry_consistency]
-# files = ["po/POTFILES.in", "po/POTFILES.skip"]
-# # pattern = "^include (.+)$"
-#
-# Then wire it as a bundle-scoped gate (T2 Shape). `registry-check` reads $PDCA_BUNDLE:
-# [[gates.checks]]
-# id = "T2-registry-reverse"
-# tier = "T2"
-# label = "manifest lines reference only paths the patch touches"
-# cmd = "pdca-autobook registry-check"
-# gating = true
-# scope = "bundle"
-
