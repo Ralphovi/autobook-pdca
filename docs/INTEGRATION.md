@@ -69,14 +69,17 @@
   employer names, and Art. 9 special-category data. A bundle whose repro needs real
   data is a bundle that needs a redesigned repro. This is a hard rule from
   Autobook's `AGENTS.md`, not a preference.
-- **Reproduction runner(s) + commands:** `[planned]` — no implementation to
-  reproduce against yet. Expect `pytest` selecting the bundle's named test.
+- **Reproduction runner(s) + commands:** `./engine/scripts/run-verify.sh` — `pytest`
+  on the bundle's named test files with the worktree's `src/` on `PYTHONPATH` and
+  `-m "not applier"`. Wired as `C4-verify`, below.
 - **Verification runner (test suite):** `./engine/nox.sh gate` (delegates to
   `nox -s gate` in the target tree). Wired as `C4-ci`, below.
 - **Platform variants:** none. Linux-first by design (proposal 0001, *Platform
   support*); macOS is unverified and Windows is deferred as a stated restriction.
-- **What counts as a successful repro:** `[planned]` — exit code from `pytest` once
-  there is code. The red→green discriminator is deliberately unwired; see §4.
+- **What counts as a successful repro:** pytest's exit code **and** at least one test
+  actually run, read from its JUnit report: red with the production hunks reverted,
+  green with them applied. A leg in which no test ran is unverifiable, never a pass;
+  see §4.
 
 **Not reachable as a gate: `nox -s applier`.** It needs the system
 `python3-gnucash` and, by Autobook's own rules, runs against a *restored copy* of a
@@ -88,15 +91,16 @@ For each tier: the **written ruleset** it consumes, its **home**, and the
 **single-sourced command** the driver and CI both run. A gate you can trace to a
 written source is auditable; one you can't is folklore.
 
-Gating policy (see `engine/README.md`): ship every tier **advisory**
-(`gating = false`) except the per-fix C4 (red→green).
+Gating policy (see `engine/README.md`): C4-ci (Autobook's own gate), C4-verify
+(red→green) and T4-contribution gate; the T2 threat-model touch check is advisory.
 
 | Tier | Written ruleset | Home | Single-sourced command | Status |
 |---|---|---|---|---|
 | T1 structure | `ruff` config (`pyproject.toml [tool.ruff]`) | `../autobook` | `./engine/nox.sh gate` (fmt, lint) | [built — folded into C4-ci] |
 | T2 shape | `mypy --strict`; the `gnucash` import ban (`flake8-tidy-imports.banned-api`) | `../autobook` | `./engine/nox.sh gate` (types, lint) | [built — folded into C4-ci] |
+| T2 threat model | `../autobook/.oss-scanner/threat_model.md` (Ralphovi/autobook#18) | this repo | `./engine/scripts/check-threat-model-touch.sh` | [built — advisory, `T2-threat-model`] |
 | T3 runtime | `pytest` suite | `../autobook` | `./engine/nox.sh gate` (test) | [built — folded into C4-ci] |
-| T4 contribution | `AGENTS.md` (Publishing defaults); `dco` + `require-issue` workflows | host CI | host-side; `pdca-autobook contribcheck` for the bundle's own artifacts | [built — host-gated] |
+| T4 contribution | `AGENTS.md` (Publishing defaults); `dco` + `require-issue` workflows | host CI | host-side; `./scripts/pdca contribcheck` for the bundle's own artifacts | [built — `T4-contribution`] |
 | T5 judgment | reviewer contract below + `AGENTS.md` review rubric | Check reviewer + sign-off | (model) | [built — contract] |
 
 **Why one gate row rather than five.** Autobook single-sources every deterministic
@@ -105,12 +109,20 @@ per-tier PDCA rows would re-declare gates PDCA does not own — exactly what
 delegation exists to avoid. The tier column above records *which written ruleset
 answers which tier*, which is the auditable part; the command is one.
 
-**The per-fix C4 (`C4-verify`) is deliberately NOT wired.** It proves a patch's test
-is red without the fix and green with it. Autobook has no implementation, so there
-is no production change to revert to establish red, and every bundle would false-fail
-C4. `engine/scripts/run-verify.sh` ships as the template's skeleton; wire it when
-build order step 2 lands real code, and give it a dedicated `../autobook-verify`
-worktree scoped by `$PDCA_LANE`, as wyrd-pdca does.
+**The per-fix C4 (`C4-verify`) is wired** (autobook-pdca#3, ported from nl-shell-pdca).
+It proves a patch's test is red without the fix and green with it. It was first left
+unwired because Autobook has no implementation, so most early bundles add new modules
+and have nothing to revert to. This version handles that case: when the reverted test
+can't even import, it reports **unverifiable** (§6, non-gating) instead of failing,
+and the human decides at sign-off. It runs in the driver's per-cycle worktree
+(`$PDCA_WORKTREE`), never in `../autobook`. Applier tests are deselected, so a bundle
+whose only test is an applier test is unverifiable too: `nox -s applier` stays a
+human-run step.
+
+**Advisory reviewers.** Every bundle gets the `adversary` and the `security-review`
+leaf (Check), and every brief gets the `plan-reviewer` (Plan), none gated by a
+self-reported difficulty field. `security-review` grades the patch against
+`../autobook/.oss-scanner/threat_model.md`.
 
 - **Reviewer family (cross-vendor, ≠ builder):** codex — canonical role body
   `agents/reviewer.md`, inlined for a codex reviewer. `AGENTS.md` carries general
@@ -199,11 +211,15 @@ worktree scoped by `$PDCA_LANE`, as wyrd-pdca does.
 | Gate delegation wrapper | `engine/nox.sh` | `./engine/nox.sh gate` | [built] |
 | Tracker scrape / handoff generator | none | `gh issue view <id>` | [not needed] |
 | Conformance gate runners | `../autobook/noxfile.py` | `./engine/nox.sh gate` | [built — host-owned] |
-| Repro / verification runners | `engine/scripts/run-verify.sh` | (unwired) | [planned — needs code to verify] |
-| Driver | `src/pdca_harness/` | `pdca-autobook run <id>` | [built — stub leaves] |
+| Repro / verification runners | `engine/scripts/run-verify.sh` (+ `lib/junit_count.py`) | `C4-verify` | [built] |
+| Threat-model touch check | `engine/scripts/check-threat-model-touch.sh` | `T2-threat-model` | [built — advisory] |
+| Target dependency install | `engine/scripts/install-target-deps.sh` | `[install].extra_bootstrap` (`make install`) | [built] |
+| CLI resolver for gate rows | `scripts/pdca` | `./scripts/pdca contribcheck` | [built] |
+| Driver | `src/pdca_harness/` | `pdca-autobook run <id>` | [built — live leaves] |
 | Act tooling (L4) | `src/pdca_harness/act.py` | `pdca-autobook act index`, `pdca-autobook act log --date <d>` | [built] |
-| Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `pdca-autobook gates [<id>] [--working-tree]` | [built — C4-ci wired] |
-| Reviewer role prompt | `agents/reviewer.md` (canonical body; inlined for codex) | (model leaf) | [built — contract; wire command mode] |
+| Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `pdca-autobook gates [<id>] [--working-tree]` | [built — C4-ci, C4-verify, T4, T2] |
+| Reviewer role prompt | `agents/reviewer.md` (canonical body; inlined for codex) | (model leaf) | [built — command mode] |
+| Security-review role prompt | `agents/security-review.md`; `.claude/agents/security-review.md` | (advisory leaf) | [built — always on] |
 | Builder role prompt | `agents/builder.md`; `.claude/agents/builder.md` + `.claude/hooks/builder_guard.py` | (model leaf) | [built — ready-mark blocked] |
 
 ## 10. Maintainer and governance
@@ -226,7 +242,11 @@ PDCA **supplements** Autobook's PR governance; it does not replace it.
 | `dco` workflow; ready-mark policy | builder/publisher STOP-discipline (`builder_guard.py` PreToolUse hook) | The hook is a *backstop*; the host workflow is the authority. |
 | `ci` (`nox -s gate`) | `./engine/nox.sh gate` via `C4-ci` | Both run the *same* command — one definition, in `../autobook/noxfile.py`. |
 
-`ship_ci_workflow = false` at render time, because Autobook runs its own CI;
+`ship_ci_workflow = true` (autobook-pdca#3): `.github/workflows/check-gates.yml` runs
+`pdca-autobook gates --working-tree` on this repo's PRs. Its only repo-scoped row is
+C4-ci, which reports unverifiable there because CI has no Autobook checkout; Autobook's
+own CI runs that gate on Autobook's PRs. `.github/workflows/require-linked-issue.yml`
+holds this repo's PRs to the same linked-issue rule as Autobook's.
 `ship_merge_guard = true`, because nothing host-side stops a model leaf from
 marking a PR ready.
 
@@ -239,6 +259,9 @@ touching classification reports **backtest numbers per method and per confidence
 band** in `SUMMARY.md`, since "seems better" is not a verdict this project accepts.
 
 ## Answering an interactive leaf from another device
+
+**Enabled here** on all five interactive leaves (planner, sign-off, publisher, Act,
+splitter), as in nl-shell-pdca.
 
 The four `interactive = true` leaves — planner, sign-off, publisher, Act — hand the terminal
 to a human+model REPL and block there. That means the human has to be at the terminal the

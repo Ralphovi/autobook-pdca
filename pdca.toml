@@ -356,7 +356,10 @@ size_guard = "off"
 # Python one); it survives `copier update` (config, not a template file). Empty ⇒ nothing.
 # For multiple concerns, drop composable scripts into scripts/bootstrap-tools.d/*.sh instead.
 [install]
-extra_bootstrap = ""
+# nox (C4-ci), pytest (C4-verify) and Autobook's own dependencies, never Autobook itself —
+# an installed copy could shadow the worktree under test. Re-reads ../autobook/pyproject.toml
+# each install.
+extra_bootstrap = "./engine/scripts/install-target-deps.sh"
 
 # Manual-test launch (`pdca-autobook try <id>`). Check's validation act and the visual / GUI /
 # manual-repro §6 NEEDS-HUMAN rows are a human call — for a GUI app that means running the
@@ -374,6 +377,8 @@ extra_bootstrap = ""
 # like a gate command; "" ⇒ `pdca-autobook try` errors with a configure-me hint.
 [manual_test]
 # cmd = "python -m gramps"   # e.g. launch the app; a "./scripts/run-app.sh" wrapper also works
+# Empty until Autobook has an entry point (build order step 1 lands the backtest CLI). Then
+# mirror nl-shell-pdca: the worktree's src/ on the instance venv, cwd = $PDCA_WORKTREE.
 cmd = ""
 
 [tracker]
@@ -391,7 +396,7 @@ issue_trailer = "Fixes #{id}"
 # DETERMINISTICALLY hyperlinks the ticket id in the PR body (a Markdown link on the id, not
 # a bare number) — it does not depend on the model complying. E.g. Mantis
 # "https://github.com/Ralphovi/autobook/view.php?id={id}", GitHub "https://github.com/Ralphovi/autobook/{id}". "" ⇒ no link (bare id).
-issue_url_pattern = ""
+issue_url_pattern = "https://github.com/Ralphovi/autobook/issues/{id}"
 # Optional default tracker export the Plan leaf reads the issue row from when `flow`
 # runs without --from-csv (it reads ONLY that issue's row, not a repo scan):
 # export_csv = "path/to/export.csv"
@@ -429,6 +434,14 @@ issue_url_pattern = ""
 # [[plan.source]]
 # type = "command"           # exactly today's notes_cmd, but one of several sources
 # cmd = "./engine/scripts/scrape-notes.sh {id}"
+
+# The tracker IS GitHub here, so `gh` is the canonical fetch: this source writes the
+# bundle's notes.json itself (role = "tracker") and the planner briefs from the full
+# issue thread with no scrape script.
+[[plan.source]]
+type = "github"
+role = "tracker"
+repo = "Ralphovi/autobook"
 
 # Publish mechanics — `pdca-autobook publish` and the flow's publish-on-accept (docs 03 §Check
 # closing step). Branch patterns are `{id}` / `{slug}` format strings; the
@@ -482,7 +495,7 @@ base_remote = "origin"
 # Do builder — writes patch.diff + test + build-notes.md:
 
 [leaves.builder]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = false
 # Role prompt: canonical body agents/builder.md. Claude resolves it via the baked
@@ -551,17 +564,17 @@ argv = ["claude", "-p", "--agent", "builder", "--permission-mode", "acceptEdits"
 # open: cleanup closes it as not planned.) A bundle already two splits deep (lineage depth
 # 2 or more) is not split again unless the human passes `--force` to `--accept`.
 [leaves.splitter]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "splitter"
-argv = ["claude", "--agent", "splitter", "--permission-mode", "acceptEdits"]
+argv = ["claude", "--remote-control", "--agent", "splitter", "--permission-mode", "acceptEdits"]
 
 [leaves.sizer]
 # Switch `mode` to "command" to enable — the argv below is ACTIVE so that one edit is
 # enough. `--allowedTools Read Write`: the leaf reads brief.md and must WRITE sizing.json,
 # and a Read-only grant would let it run and produce nothing.
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = false
 agent = "sizer"
@@ -579,7 +592,7 @@ argv = ["claude", "-p", "--agent", "sizer", "--allowedTools", "Read", "Write", "
 # argv = ["claude", "-p", "--agent", "sizer", "--allowedTools", "Read", "Write", "--model", "sonnet"]
 
 [leaves.reviewer]
-mode = "stub"
+mode = "command"
 family = "codex"
 interactive = false
 # Role prompt: canonical body agents/reviewer.md, inlined for codex / resolved via
@@ -631,35 +644,35 @@ argv = ["codex", "exec", "--sandbox", "workspace-write", "--skip-git-repo-check"
 # generically to every backend. The headless builder/reviewer must NOT carry it: it starts
 # an *interactive* session and they have no human to reach.
 [leaves.planner]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "planner"
-argv = ["claude", "--agent", "planner", "--permission-mode", "acceptEdits"]
+argv = ["claude", "--remote-control", "--agent", "planner", "--permission-mode", "acceptEdits"]
 
 [leaves.signoff]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "signoff"
-argv = ["claude", "--agent", "signoff", "--permission-mode", "acceptEdits"]
+argv = ["claude", "--remote-control", "--agent", "signoff", "--permission-mode", "acceptEdits"]
 
 [leaves.act]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "act"
-argv = ["claude", "--agent", "act", "--permission-mode", "acceptEdits"]
+argv = ["claude", "--remote-control", "--agent", "act", "--permission-mode", "acceptEdits"]
 
 # Publisher — Check's closing step: writes commit-msg.txt + pr-description.md (the
 # git/draft-PR mechanics are deterministic code in pdca_harness.publish). A non-claude
 # publisher gets the driver's `gh` STOP-shim (guard.py) since it has no PreToolUse hook.
 [leaves.publisher]
-mode = "stub"
+mode = "command"
 family = "claude"
 interactive = true
 agent = "publisher"
-argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
+argv = ["claude", "--remote-control", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 
 
 # FAMILY PROFILES (vendor neutrality). Every vendor-CLI-specific behavior is DATA
@@ -715,14 +728,32 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # red→green evidence and the reviewer's verdict (defaults to "refuted" when uncertain),
 # gated to the highest blast-radius bundles via the Difficulty signal (#133). Advisory —
 # never gates; its `- NEEDS-HUMAN —` findings route into SUMMARY §6.
-# [[leaves.advisory]]
-# id = "adversary"
-# role = "refute the red→green evidence and the reviewer's verdict; find the input that breaks the fix"
-# mode = "stub"
-# family = "claude"
-# argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
-# when = { field = "difficulty", substring = "high" }
+# Live on every bundle (no `when`): a self-reported difficulty field must not route a patch
+# away from the review that would catch the mis-rating — the same reasoning as security-review.
+[[leaves.advisory]]
+id = "adversary"
+role = "refute the red→green evidence and the reviewer's verdict; find the input that breaks the fix"
+mode = "command"
+family = "claude"
+argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
+
+# The SECURITY lens (ported from eduralph/nl-shell-pdca, after getwyrd/wyrd-pdca#274): reads
+# the patch the way an attacker would — and, for Autobook, the way an accident would — and
+# rates findings against Autobook's own threat model ($PDCA_TARGET/.oss-scanner/threat_model.md,
+# Ralphovi/autobook#18), not a generic checklist. None of the other lenses asks that question,
+# and Autobook writes to people's books and handles their bank memos.
 #
+# ALWAYS ON (no `when`): the only selector is a brief field the planner writes, and a
+# self-reported field must not route a patch away from the review that would catch the
+# mis-rating. A patch that touches no attacker-reachable input gets a one-line verdict, so
+# the cost stays small. Claude, like the builder: it stands apart by ROLE, as the adversary does.
+[[leaves.advisory]]
+id = "security-review"
+role = "security: what an attacker controlling the patch's inputs could do, rated against the target's threat model"
+mode = "command"
+family = "claude"
+argv = ["claude", "-p", "--agent", "security-review", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
+
 # Advisory-selection policy (issue #64 default vs. issue #200). Unset ⇒ every advisory leaf
 # above whose `when` matches runs. Opt into `vendor-complement` to make cross-vendor
 # decorrelation (INTEGRATION §4) automatic: the driver treats the [[leaves.advisory]] list
@@ -758,13 +789,12 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # working directory, and the harness denies file edits on the pinned target and on the
 # bundle. Listing `Write` here would pre-approve it for EVERY path — observed: it then
 # overwrote a file outside all of the leaf's granted directories.
-# [[leaves.plan_advisory]]
-# id = "plan-reviewer"
-# role = "refute the brief: wrong root cause, untestable success criterion, hidden scope"
-# mode = "stub"
-# family = "claude"
-# argv = ["claude", "-p", "--agent", "plan-reviewer", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
-# when = { field = "difficulty", substring = "high" }
+[[leaves.plan_advisory]]
+id = "plan-reviewer"
+role = "refute the brief: wrong root cause, untestable success criterion, hidden scope"
+mode = "command"
+family = "claude"
+argv = ["claude", "-p", "--agent", "plan-reviewer", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
 #
 # [leaves.plan_advisory_selection]
 # mode = "vendor-complement"   # anchor: the PLANNER family (the brief's author)
@@ -898,6 +928,49 @@ argv = ["claude", "--agent", "publisher", "--permission-mode", "acceptEdits"]
 # per_lane = true
 # level = "WARN"
 
+# --- autobook-pdca's rows -------------------------------------------------------------
+[[doctor.checks]]
+group = "target"
+id = "sibling checkout ../autobook"
+cmd = "test -e ../autobook/.git"
+hint = "git clone https://github.com/Ralphovi/autobook.git ../autobook"
+required = true
+
+[[doctor.checks]]
+group = "target"
+id = "threat model (security-review leaf)"
+cmd = "test -f ../autobook/.oss-scanner/threat_model.md"
+hint = "the security-review advisory leaf rates every patch against it; it lands with Ralphovi/autobook#18"
+level = "WARN"
+
+[[doctor.checks]]
+group = "engine"
+id = "nox runnable (C4-ci)"
+cmd = "command -v nox >/dev/null 2>&1 || test -x .venv/bin/nox"
+hint = "make install — [install].extra_bootstrap installs nox into .venv"
+required = true
+
+[[doctor.checks]]
+group = "engine"
+id = "pytest importable (.venv, C4-verify)"
+cmd = ".venv/bin/python3 -c 'import pytest'"
+hint = "make install — [install].extra_bootstrap installs pytest and Autobook's deps into .venv"
+required = true
+
+[[doctor.checks]]
+group = "engine"
+id = "pdca CLI resolvable (T4 row)"
+cmd = "./scripts/pdca --help"
+hint = "make install — or point $PDCA_CLI at the CLI; ./scripts/pdca resolves venv -> src -> PATH"
+required = true
+
+[[doctor.checks]]
+group = "engine"
+id = "bash >= 4 (gate scripts use mapfile)"
+cmd = "bash -c 'test \"${BASH_VERSINFO[0]}\" -ge 4'"
+hint = "install a modern bash"
+level = "WARN"
+
 # Deterministic Check gates (docs 04). Each check runs a shell command; it PASSES
 # iff the command exits 0. `scope = "repo"` runs against the working tree (and is
 # what CI re-runs via `pdca-autobook gates --working-tree`); `scope = "bundle"` needs the
@@ -1029,16 +1102,27 @@ checks = [
   # The whole Autobook gate, wholesale: ruff format + ruff check + mypy --strict + pytest
   # + typos + the docs lint, run identically on a laptop, in CI, and here. Autobook's
   # noxfile.py is the single source of gate truth; this row orchestrates it and
-  # re-declares nothing.
-  { id = "C4-ci", tier = "C4", label = "Autobook gate: nox -s gate (fmt/lint/types/test/typos/docs)", subcmd = "gate", gating = true, scope = "repo" },
+  # re-declares nothing. Tier C4 by role, but NOT the per-fix verifier: C4-verify below is,
+  # so only it receives the base ladder (verifies_base, pdca-harness#474).
+  { id = "C4-ci", tier = "C4", label = "Autobook gate: nox -s gate (fmt/lint/types/test/typos/docs)", subcmd = "gate", gating = true, scope = "repo", verifies_base = false },
 
-  # NOT WIRED YET — the per-fix red->green discriminator (engine/scripts/run-verify.sh
-  # ships as a skeleton). It is deliberately absent rather than stubbed-in-and-failing:
-  # Autobook has no implementation, so there is no production change a patch could revert
-  # to prove red, and every bundle would false-fail C4. Wire it when build order step 2
-  # lands actual code, and give it its own ../autobook-verify worktree scoped by $PDCA_LANE
-  # the way wyrd-pdca's C4-verify does.
-  # { id = "C4-verify", tier = "C4", label = "per-fix red->green", cmd = "./engine/scripts/run-verify.sh", gating = false, scope = "bundle", promote_after = 3 },
+  # Per-fix red->green proof (ported from eduralph/nl-shell-pdca): the bundle's own tests,
+  # red with the production hunks reverted, green with them applied, judged by pytest's exit
+  # code AND the number of tests that ran. It was left unwired while Autobook had no code,
+  # because a revert could not go red; this version reports UNVERIFIABLE (§6, non-gating)
+  # instead of failing when the test can't even import without the fix, which is the
+  # greenfield case. Applier tests are deselected, as in Autobook's own gate.
+  { id = "C4-verify", tier = "C4", label = "fix verified: bundle test red pre-fix, green post-fix (pytest)", cmd = "./engine/scripts/run-verify.sh", gating = true, scope = "bundle" },
+
+  # T4 goes through scripts/pdca so it resolves this checkout's CLI whether or not .venv/bin
+  # is on PATH (a bare console-script name is not). The template only renders this row for
+  # instances without a gates runner (eduralph/pdca-harness#688), so it is added here.
+  { id = "T4-contribution", tier = "T4", label = "PR body has a user-impact opener + tracker id in both artifacts", cmd = "./scripts/pdca contribcheck", gating = true, scope = "bundle" },
+
+  # Advisory: a patch touching Autobook's book-write, review, redaction, classification,
+  # pack, ingest or logging code (or AGENTS.md / SECURITY.md) without updating the threat
+  # model lands in SUMMARY §6.
+  { id = "T2-threat-model", tier = "T2", label = "security-relevant change also updates the threat model", cmd = "./engine/scripts/check-threat-model-touch.sh", gating = false, scope = "bundle" },
 ]
 
 
