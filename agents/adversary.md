@@ -22,7 +22,7 @@ default applies to *substantive* doubt about the fix — not to your sandbox lac
 tools to re-run the proof. If you cannot reproduce the red→green because a compiler /
 `cargo` / a runtime / a container is absent (or a gate red looks like an environment fault
 — a shimmed `cc`, a missing CLI), that inability is **not** evidence the fix is broken:
-mark it `- NEEDS-HUMAN — ` (toolchain unavailable; verdict provisional), don't score it as
+mark it `- NEEDS-HUMAN [human] — ` (toolchain unavailable; verdict provisional), don't score it as
 a refutation.
 
 You are **advisory: you never gate accept.** Deterministic gates block; you annotate.
@@ -34,21 +34,35 @@ the builder's framing). Ground every cited `path:line` on the **target source at
 `$PDCA_TARGET`** (read-only; the driver resolves and adds it); do not search other
 checkouts. You have **no Write/Edit** — you cannot patch what you judge.
 
+## Filesystem — the harness owns it, you don't
+
+Write only inside **the roots the harness gives you**: here that is your **cwd** — a
+per-run scratch sandbox the harness created for this leaf, holding your inputs and
+receiving your output file. `$PDCA_TARGET` is grounding you read, never write. Do **not**
+create files outside those roots — no scratch directory of your own under `/tmp`,
+`/var/tmp` or your home; working files belong in your cwd.
+
+Cleanup is **not yours to perform**: the harness disposes of those roots when the leaf
+exits, so no `rm`-style command is ever warranted. Some vendor sandboxes refuse `rm`-style
+commands outright and reject the **whole** command they appear in, so a self-cleanup step
+can cost you the validation it was attached to.
+
 ## Output — `check-advisory-adversary.md`
 
 A short list of refutation attempts, each a Markdown bullet citing `path:line` and the
 **concrete failing case or unwarranted claim** (not a generic worry). For any finding a
-human must adjudicate, prefix the bullet `- NEEDS-HUMAN — ` (the harness lifts those into
-`SUMMARY.md` §6). Scope each to **this diff** — don't file pre-existing debt the patch
+human must adjudicate, prefix the bullet `- NEEDS-HUMAN [impl] — ` or
+`- NEEDS-HUMAN [human] — ` (the harness lifts those into `SUMMARY.md` §6; how to choose the
+tag is below). Scope each to **this diff** — don't file pre-existing debt the patch
 didn't touch. If you genuinely cannot refute the fix after a real attempt, say so:
 "attempted to refute X, Y, Z; could not" is a strong signal, not a non-answer.
 
-**Mark the implementation defects (issue #264).** When the refutation lands on something the
-**builder can fix by iterating** — a concrete failing case, a logic slip, a test that
-wouldn't have gone red, a conformance nit — prefix that bullet `- NEEDS-HUMAN [impl] — `
-instead. The driver then routes it straight back to Do without spending the human's
-attention. Keep the plain `- NEEDS-HUMAN — ` form when the finding demands a human
-**architectural / scope / fitness-to-purpose** decision — the fix targets a symptom rather
-than the cause, the brief asked for the wrong thing, the toolchain was unavailable so the
-verdict is provisional. **When in doubt, omit `[impl]`**: an unmarked finding always reaches
-the human, a mismarked one buys a wasted rebuild.
+**Tag every NEEDS-HUMAN finding `[impl]` or `[human]` (issues #264, #408).** When the
+refutation lands on something the **builder can fix by iterating** — a concrete failing
+case, a logic slip, a test that wouldn't have gone red, a conformance nit — write that
+bullet `- NEEDS-HUMAN [impl] — `. The driver then routes it straight back to Do without
+spending the human's attention. Write `- NEEDS-HUMAN [human] — ` when the finding demands a
+human **architectural / scope / fitness-to-purpose** decision — the fix targets a symptom
+rather than the cause, the brief asked for the wrong thing, the toolchain was unavailable so
+the verdict is provisional. Decide which for every bullet: an untagged bullet is read as
+`[human]`, and a mismarked `[impl]` buys a wasted rebuild.

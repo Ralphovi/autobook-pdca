@@ -31,15 +31,26 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import brief, leaves, state
+from . import brief, gates, leaves, progress, state, worktree
+# Aliased: `publish()` builds a local `record = {...}` (its publish.json payload,
+# below) that would shadow the module name at the #317 call-in.
+from . import record as record_mod
 from .config import Config
 
 COMMIT_MSG = "commit-msg.txt"
 PR_BODY = "pr-description.md"
 # The wave driver records the run's integration branch here for a wave>0 bundle, so its
-# Do worktree and stacked PR base off the prior waves' folded work (#wave-model); absent ⇒
-# build / open the PR off the target base.
+# Do worktree is cut from the prior waves' folded work (#wave-model); its PR targets the
+# real base (#593). Absent ⇒ build and cut the PR branch off the target base.
 STACK_BASE_FILE = "stack-base"
+# Beside it, the line commit the run's last fold pushed (one SHA) — the commit the bundle
+# was built on, and the one publish cuts its PR branch from (#593). Ignored without a
+# `stack-base`; absent (a dry-run, or a marker older than #593) ⇒ cut from the branch.
+STACK_BASE_TIP_FILE = "stack-base-tip"
+# The pre-push host-CI record (issue #311): the [gates] host_ci rows as run against the
+# pinned base + patch.diff tree, written when the gate REFUSES (so the refusal survives
+# for the human, naming the command and the base) and removed again once they pass.
+HOST_CI_JSON = "host-ci.json"
 
 
 def _ensure_texts(cfg: Config, d: Path) -> bool:
@@ -79,8 +90,9 @@ def draft_texts(cfg: Config, d: Path, *, run_t4: bool = True, draft: bool = True
     legitimately nothing to draft (not COMPLETE, a close/no-fix empty patch, no usable
     target): :func:`publish`'s own guards re-decide and report those with their richer
     messages. False = drafting or T4 failed: do not enter the mechanics loop. (The
-    ``--no-issue``/pending-id T4 relaxation stays exclusive to :func:`publish` — the
-    flow never publishes pending-id.)
+    ``--no-issue``/pending-id narrow T4 mode stays exclusive to :func:`publish` — the
+    flow never publishes pending-id, so this pre-pass always gates in the default
+    id-known mode.)
     """
     if state.state(d) != state.COMPLETE:
         return True
@@ -125,10 +137,13 @@ def publish(
 
     ``pending_id`` (``--no-issue``): the first-class "no tracker id yet" path. A
     project may need to contribute before a tracker number is assigned; rather than a
-    magic ``Fixes #0000`` placeholder, declare it here. The T4 contribution gate is
-    then **relaxed to a flag** instead of a hard block, and the bundle is recorded
-    ``id_pending`` so the human adds the real id and re-gates T4 before marking the PR
-    ready. The publisher leaf omits the trailer (no invented id) in this case.
+    magic ``Fixes #0000`` placeholder, declare it here. The T4 contribution gate then
+    runs in the **narrow pending-id mode** (#384): ``$PDCA_PENDING_ID`` is exported so
+    the registered checker drops exactly the tracker-id requirement (``contribcheck
+    --no-issue``) — every other contribution rule still hard-blocks the push. The
+    bundle is recorded ``id_pending`` so the human adds the real id and re-gates T4
+    before marking the PR ready. The publisher leaf omits the trailer (no invented
+    id) in this case.
 
     ``texts_prevalidated`` (set by the flow, #295 review): the caller already ran
     :func:`draft_texts` — drafting AND the T4 gate — over this bundle, so this call is
@@ -184,21 +199,19 @@ def publish(
         if not _ensure_texts(cfg, d):
             return 1
 
-        # T4 contribution gate — the artifacts MUST pass before anything is pushed,
-        # UNLESS pending_id (--no-issue): then a T4 failure is relaxed to a flag, since
-        # the one thing legitimately missing is the not-yet-assigned tracker id. The
-        # bundle is recorded id_pending so the human adds the id and re-gates T4 before
-        # ready.
-        if not _t4_passes(cfg, d):
-            if pending_id:
-                print(f"publish: T4 contribution gate not satisfied on {COMMIT_MSG} / "
-                      f"{PR_BODY} — proceeding in --no-issue (pending-id) mode; the "
-                      "contribution is FLAGGED. Add the tracker id and re-run T4 before "
-                      "marking the PR ready.", file=sys.stderr)
-            else:
-                print(f"publish: T4 contribution gate FAILED on {COMMIT_MSG} / {PR_BODY} — "
-                      "fix them and retry", file=sys.stderr)
-                return 1
+        # T4 contribution gate — the artifacts MUST pass before anything is pushed, in
+        # BOTH modes. Under pending_id (--no-issue) the gate itself runs in the narrow
+        # pending-id mode (#384): the one thing legitimately missing is the
+        # not-yet-assigned tracker id, so exactly that requirement is dropped — by the
+        # checker (`contribcheck --no-issue` via $PDCA_PENDING_ID), not by waving the
+        # whole failed gate through as a printed flag, which also amnestied a broken PR
+        # body / commit message. Whatever still fails here is a real defect that blocks
+        # the push. The bundle is still recorded id_pending so the human adds the id
+        # and re-gates T4 before ready.
+        if not _t4_passes(cfg, d, pending_id=pending_id):
+            print(f"publish: T4 contribution gate FAILED on {COMMIT_MSG} / {PR_BODY} — "
+                  "fix them and retry", file=sys.stderr)
+            return 1
     elif not ((d / COMMIT_MSG).is_file() and (d / PR_BODY).is_file()):
         # Defensive: prevalidated promises the texts exist; a vanished artifact means
         # the promise no longer holds — refuse rather than push without a commit message.
@@ -218,8 +231,11 @@ def publish(
     # produced earlier in THIS run — build + publish a NEW draft PR based on that branch (a
     # separate stacked PR), not on the target base. Distinct from `Onto branch` (#54), which
     # appends a commit to one existing PR. The base is derived from the prereq's publish.json
-    # (never hand-written — it doesn't exist at Plan time).
-    stack_branch = _stack_base_branch(cfg, d)
+    # (never hand-written — it doesn't exist at Plan time). A wave's recorded stack base wins,
+    # as in :func:`_stack_base_branch`.
+    wave_base = _read_stack_base(d)
+    wave_tip = read_stack_base_tip(d)
+    stack_branch = wave_base or _stacks_on_branch(cfg, d)
     if brief.stacks_on(d / "brief.md") and not stack_branch:
         print(f"publish: {d.name} `Stacks on` a prereq with no published branch yet — the "
               "prereq must publish first (the flow schedules this).", file=sys.stderr)
@@ -231,23 +247,54 @@ def publish(
 
     git = lambda *a: ["git", "-C", str(repo), *a]
     base_remote = cfg.base_remote
-    # Stacked: cut the dependent's branch off the PARENT / integration branch (on origin) so it
-    # carries the predecessors' diffs; otherwise off the target base (#123). pr_base is what
-    # `gh --base` gets — and it MUST be a branch in the upstream (`--repo`) repo.
-    checkout_base = f"origin/{stack_branch}" if stack_branch else f"{base_remote}/{base}"
-    # Own-repo (base on origin): the integration/parent branch IS an upstream branch, so
-    # `--base` it for a clean, increment-only stacked PR. Fork (base on a separate upstream a
-    # fork contributor can't push to): that branch lives on origin (the fork) and can't be a
-    # `--base`, so the PR opens against the upstream base and carries the CUMULATIVE stacked
-    # diff (predecessors + this fix). It still merges cleanly bottom-up — once a prerequisite
-    # is merged, its identical content re-merges as a no-op — but the displayed diff does NOT
-    # auto-reduce on merge: the fold's `pdca-integrate:*` commits aren't ancestors of the
-    # prereq's PR-merge, so the PR merge-base doesn't advance; the diff clears only when the
-    # dependent is rebuilt off the merged base (a later `pdca flow` run). That visible overlap
-    # is the cost of fork wave-stacking (#185). The dependent's branch is cut off the parent
-    # branch either way.
     own_repo = base_remote == "origin"
-    pr_base = stack_branch if (stack_branch and own_repo) else base
+    wave_stacked = cfg.wave_mode != "merge" and bool(wave_base)
+    # Stacked: cut the dependent's branch off the PARENT / integration branch (on origin) so it
+    # carries the predecessors' work; otherwise off the target base (#123). A wave>0 bundle is
+    # cut from the line commit it was built on, when the run recorded one (#593): the line
+    # keeps growing after its wave, so a held bundle published later off the branch as it is
+    # THEN would carry later waves' work into its PR against the real base. That commit IS
+    # `checkout_base`, so the host-CI gate below fetches, pins and certifies the same commit
+    # (its `host_ci_base` is the recorded tip), and `_line_tip_refusal` first checks the line
+    # still holds it. pr_base is what `gh --base` gets — and it MUST be a branch in the
+    # upstream (`--repo`) repo.
+    cut_from_tip = wave_stacked and bool(wave_tip)
+    if cut_from_tip:
+        checkout_base = wave_tip
+    else:
+        checkout_base = f"origin/{stack_branch}" if stack_branch else f"{base_remote}/{base}"
+    # A wave>0 bundle (a recorded `stack-base`) opens its PR against its REAL target base, on
+    # the own-repo and fork paths alike (#593): the integration branch is a run-scoped
+    # staging line, and a PR merged into it never reaches the target. The PR carries every
+    # earlier-wave branch on the line, not only its own predecessors', and shows their
+    # changes until they merge. Those are the commits of their own PRs (the fold merges the
+    # published branches, never re-applied copies), so merging the stack bottom-up with
+    # merge commits lands every wave on the target. Once they have all merged, this PR's diff
+    # against the base is its own change when the line is a plain chain (one branch per
+    # earlier wave, no newer base taken in). Otherwise a fold merge commit joined histories
+    # the base got separately, and the PR can keep showing an already-merged change until its
+    # branch is updated from the base (GitHub's "Update branch"); integrate's module docstring
+    # has the detail.
+    # Only a hand-declared legacy `Stacks on:` parent (no stack-base) keeps the parent branch
+    # as the `--base` on own-repo (#123). A fork can never `--base` a branch on origin (the
+    # fork), so a fork PR always opens against the upstream base (#185). Merge mode records
+    # no stack-base, and its own guard (#411, below) judges the base this picks, unchanged.
+    pr_base = stack_branch if (stack_branch and own_repo and not wave_stacked) else base
+    # Merge-mode base guard (#411) — fail-closed, BEFORE any branch/push/PR work. Under
+    # `[driver].wave_mode = "merge"` the driver merges each accepted bundle's PR "into its
+    # base" (merge.py:32-33), unattended, mid-flow — whatever base that PR happens to carry.
+    # So a PR opened against a branch THIS run produced silently lands the fix in another
+    # bundle's branch instead of the shared target, and the wave still reports success.
+    # Refuse here rather than at merge time: the publisher is an interactive step with a
+    # human present, and a PR never opened against a run-produced branch leaves the merge
+    # nothing wrong to merge. Same shape as the `Stacks on` refusal above (stderr, return 1,
+    # nothing pushed). Stack mode — the default — is untouched: chaining onto a predecessor
+    # is correct there, because nothing is ever merged for you.
+    if cfg.wave_mode == "merge":
+        refusal = _merge_base_refusal(cfg, d, repo_spec, pr_base, base)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 1
     steps = [
         git("fetch", "origin" if stack_branch else base_remote),
         git("checkout", "-B", branch, checkout_base),
@@ -287,9 +334,20 @@ def publish(
     if dry_run:
         kind = "draft PR"
         if stack_branch:
-            kind = "stacked draft PR" if own_repo else "stacked draft PR (fork: cumulative diff vs base)"
+            kind = ("stacked draft PR" if pr_base == stack_branch
+                    else "stacked draft PR (fork: cumulative diff vs base)" if not own_repo
+                    else "stacked draft PR (cumulative diff vs base)")
         print(f"publish --dry-run — {d.name} → {kind} on {repo_spec} ({branch} → {pr_base}):")
         print(f"  # stash the target working tree (Do/Check leave it dirty), restore it after")
+        if cut_from_tip:
+            print(f"  # line-tip guard (#593): fetch --prune origin and refuse, pushing "
+                  f"nothing, unless the recorded tip {wave_tip} is still on "
+                  f"origin/{stack_branch} (else re-drive it in a new run)")
+        if cfg.host_ci_checks:
+            print(f"  # host CI gate (#311): fetch, pin the exact {checkout_base} commit the "
+                  f"push will build on, and run {len(cfg.host_ci_checks)} declared command(s) "
+                  "against base + patch.diff in an ephemeral worktree — ANY non-zero exit "
+                  "blocks the push")
         for c in steps + ([pr_cmd] if open_pr else []):
             print("  " + " ".join(shlex.quote(x) for x in c))
         return 0
@@ -301,8 +359,32 @@ def publish(
     rc = _check_repo(repo, repo_spec, required_remotes={base_remote, "origin"})
     if rc != 0:
         return rc
+    if cut_from_tip:
+        # Never cut from an orphaned tip (#593): once a later run's first fold has replaced
+        # the line, the recorded commit is on no line, and a PR cut from it would carry work
+        # no fold of this target holds any more. Refuse before anything is pushed.
+        refusal = _line_tip_refusal(d, repo, wave_tip, stack_branch)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 1
     if stack_branch:
         _warn_if_squash_only(repo_spec)  # a stacked PR must merge-commit, not squash (#123)
+
+    # Host-only CI parity gate ([gates] host_ci, issue #311): the declared commands must
+    # pass against the tree the push would publish, before anything is pushed. The T4
+    # gate above runs with cwd=cfg.root against the tree BEFORE patch.diff is applied,
+    # so it structurally cannot see content that arrives in the patch (the wyrd `typos`
+    # class: Check green, PR opens red on a required status). The gate fetches and PINS
+    # the exact base commit; the plan's `checkout -B` is then rebased onto that same
+    # commit so the certified tree IS the pushed tree even when the base advanced since
+    # Check (iteration-1 C5). Undeclared ⇒ ci_base stays "" and the steps run unchanged.
+    ci_ok, ci_base = _host_ci_passes(cfg, d, repo,
+                                     "origin" if stack_branch else base_remote,
+                                     checkout_base)
+    if not ci_ok:
+        return 1
+    if ci_base:
+        steps = _pin_checkout(steps, git, branch, ci_base)
 
     orig_ref = _current_ref(repo)
     stashed = _stash_worktree(repo)
@@ -340,6 +422,10 @@ def publish(
         "by": by or _signoff_by(d) or cfg.author or "unknown", "date": today,
         "id_pending": pending_id,
     }
+    if ci_base:
+        # The base commit the host-CI gate certified — and, via _pin_checkout, the exact
+        # parent the pushed branch was built on (#311): auditable certified == pushed.
+        record["host_ci_base"] = ci_base
     if stack_branch:
         record["stacks_on"] = brief.stacks_on(d / "brief.md")
     (d / "publish.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -357,6 +443,9 @@ def publish(
         print("  ⚠ id_pending: contributed without a tracker id — add the trailer "
               "(Fixes #N) and re-run T4 before marking the PR ready.")
     print("  STOP: review CI, then mark it ready / merge yourself — the human's step.")
+    # Recording call-in (#317): strictly AFTER the publish.json write above — never
+    # mid-publish — and best-effort ([records] mode "off", the default, is a no-op).
+    record_mod.after_publish(cfg)
     return 0
 
 
@@ -399,6 +488,11 @@ def _publish_stacked(
         print(f"publish --dry-run — {d.name} → commit stacked onto {repo_spec} "
               f"PR branch {branch} (base {base_ref}):")
         print(f"  # stash the target working tree (Do/Check leave it dirty), restore it after")
+        if cfg.host_ci_checks:
+            print(f"  # host CI gate (#311): fetch, pin the exact {base_ref} commit the "
+                  f"push will build on, and run {len(cfg.host_ci_checks)} declared command(s) "
+                  "against base + patch.diff in an ephemeral worktree — ANY non-zero exit "
+                  "blocks the push")
         for c in steps:
             print("  " + " ".join(shlex.quote(x) for x in c))
         print("  " + " ".join(shlex.quote(x) for x in pr_list)
@@ -417,6 +511,15 @@ def _publish_stacked(
               "'Onto branch' brief field to use the default new-PR flow.", file=sys.stderr)
         return 1
 
+    # Host-only CI parity gate (#311) — this path pushes too, so it is gated the same
+    # way as the new-PR path: fetch, pin the exact PR-branch commit the push builds on,
+    # run the declared commands against pinned base + patch.diff, block on ANY non-zero.
+    ci_ok, ci_base = _host_ci_passes(cfg, d, repo, remote, base_ref)
+    if not ci_ok:
+        return 1
+    if ci_base:
+        steps = _pin_checkout(steps, git, branch, ci_base)
+
     # Stash the (Do/Check-dirtied) tree so checkout -B + apply run clean; restore after (#83).
     orig_ref = _current_ref(repo)
     stashed = _stash_worktree(repo)
@@ -433,12 +536,15 @@ def _publish_stacked(
     finally:
         _restore_worktree(repo, orig_ref, stashed)
 
-    (d / "publish.json").write_text(json.dumps({
+    rec = {
         "mode": "stacked",
         "branch": branch, "pr_url": pr_url, "base": base_ref, "repo": repo_spec,
         "by": by or _signoff_by(d) or cfg.author or "unknown", "date": today,
         "id_pending": pending_id,
-    }, indent=2) + "\n", encoding="utf-8")
+    }
+    if ci_base:
+        rec["host_ci_base"] = ci_base  # certified == pushed, auditable (#311)
+    (d / "publish.json").write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
 
     print(f"\nCommit stacked onto {repo_spec} PR branch {branch} ({pr_url}).")
     print(f"  watch CI:  gh pr checks {pr_url} --watch")
@@ -446,6 +552,9 @@ def _publish_stacked(
         print("  ⚠ id_pending: contributed without a tracker id — add the trailer "
               "(Fixes #N) and re-run T4 before marking the PR ready.")
     print("  STOP: review CI, then mark it ready / merge yourself — the human's step.")
+    # Recording call-in (#317): same contract as the new-PR path — strictly after
+    # this path's publish.json write, best-effort, no-op under mode "off".
+    record_mod.after_publish(cfg)
     return 0
 
 
@@ -473,35 +582,20 @@ def _existing_pr(pr_list_cmd: list[str], branch: str, owner: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-def _clean_ref(raw: str) -> str:
-    """Isolate a git ref / repo spec from a brief field side, tolerating markdown
-    backticks and trailing prose. A ref / ``owner/repo`` has no spaces, so a
-    fully-backtick-quoted ref (``\\`main\\``` / ``\\`owner/repo\\```) wins, else the first
-    whitespace token; strip stray backticks and trailing sentence punctuation.
-
-    The backtick span is honored only when it is the START of the field (``re.match``),
-    NOT anywhere in it (#235): a base written ``main (feature branch \\`feat/x\\`)`` names
-    the base ``main`` — the backticked span is a parenthetical aside about a *different*
-    branch, and taking it silently resolves the wrong base (whose ref doesn't exist →
-    worktree isolation was falling back to mutating the operator's checkout in place)."""
-    raw = raw.strip()
-    m = re.match(r"`([^`]+)`", raw)               # a fully-backtick-quoted ref at the start wins
-    token = m.group(1) if m else (raw.split()[0] if raw.split() else "")
-    return token.strip("`").rstrip(",.;:")
-
-
 def _resolve_target(d: Path) -> tuple[str, str, str]:
     """``(repo_spec, base_branch, slug)`` from the brief, e.g.
     ``("example-org/example-repo", "main", "fix-the-thing")``.
 
-    The target field is commonly written with markdown backticks and/or trailing
-    prose after the branch; ``_clean_ref`` isolates the ref on each side of ``@`` so
-    that style doesn't corrupt the resolved checkout/base (see #25)."""
+    The target field is commonly written with markdown backticks and/or trailing prose
+    after the branch; ``brief.repo_target`` isolates the ref on each side of ``@`` so that
+    style doesn't corrupt the resolved checkout/base (see #25). That parse lives in
+    ``brief`` — with the other per-field accessors — rather than here (issue #387): the
+    same value has to reach a bundle-scoped gate command as ``$PDCA_BRIEF_BASE``, and a
+    second implementation of it is exactly what #235 and #262 were."""
     bp = d / "brief.md"
-    target = brief.field(bp, "repo + branch target", "repo + branch", "target")
-    repo_spec, _, base = target.partition("@")
+    repo_spec, base = brief.repo_target(bp)
     slug = brief.field(bp, "slug") or d.name.removeprefix("issue_")
-    return _clean_ref(repo_spec), _clean_ref(base), _slugify(slug)
+    return repo_spec, base, _slugify(slug)
 
 
 def _slugify(s: str) -> str:
@@ -541,18 +635,30 @@ def _publish_record(d: Path) -> dict | None:
         return None
 
 
-def write_stack_base(d: Path, branch: str) -> None:
-    """Record the integration branch a wave>0 bundle stacks on, so its Do worktree and
-    stacked PR base off the prior waves' folded work (read by :func:`_stack_base_branch`)."""
+def write_stack_base(d: Path, branch: str, tip: str | None = None) -> None:
+    """Record the integration branch a wave>0 bundle stacks on, so its Do worktree is cut
+    from the prior waves' folded work (read by :func:`_stack_base_branch`).
+
+    ``tip`` (#593) is the line commit the run's last fold pushed: the commit the bundle is
+    built on, and the one publish cuts its PR branch from, however much the line grows
+    before it is published. It goes to its own file beside ``stack-base``
+    (:data:`STACK_BASE_TIP_FILE`), so ``stack-base`` keeps its one-line format for every
+    other reader; without a ``tip`` (a dry-run) any earlier tip file is removed."""
     (d / STACK_BASE_FILE).write_text(branch + "\n", encoding="utf-8")
+    if tip:
+        (d / STACK_BASE_TIP_FILE).write_text(tip + "\n", encoding="utf-8")
+    else:
+        (d / STACK_BASE_TIP_FILE).unlink(missing_ok=True)
 
 
 def clear_stack_base(d: Path) -> None:
     """Remove any recorded integration stack base so the bundle builds off its own target
     base. Clears a **stale** marker a prior/resumed run wrote for a target that this run does
-    not integrate — otherwise the bundle would build + open its PR against an old integration
-    branch (read via :func:`_stack_base_branch`) instead of its own base (#187)."""
+    not integrate — otherwise the bundle would build on (and cut its PR branch from) an old
+    integration branch (read via :func:`_stack_base_branch`) instead of its own base (#187).
+    The recorded line tip goes with it (#593)."""
     (d / STACK_BASE_FILE).unlink(missing_ok=True)
+    (d / STACK_BASE_TIP_FILE).unlink(missing_ok=True)
 
 
 def _read_stack_base(d: Path) -> str:
@@ -572,17 +678,70 @@ def read_stack_base(d: Path) -> str:
     return _read_stack_base(d)
 
 
+def read_stack_base_tip(d: Path) -> str:
+    """The line commit recorded with the bundle's stack base (:func:`write_stack_base`), or
+    "" — none recorded (a dry-run, or a marker older than #593), or no ``stack-base`` at all
+    (a tip file without one is ignored). Publish cuts a wave>0 PR branch from it (#593)."""
+    tip = d / STACK_BASE_TIP_FILE
+    if not (d / STACK_BASE_FILE).exists() or not tip.exists():
+        return ""
+    return tip.read_text(encoding="utf-8").strip()
+
+
+def _line_tip_refusal(d: Path, repo: Path, tip: str, line: str) -> str:
+    """Why publish must not cut ``d``'s PR branch from its recorded line tip, or "" (#593).
+
+    The tip is the line commit the bundle was built on (:func:`read_stack_base_tip`). It
+    is safe to cut from only while ``origin/<line>`` still holds it: a later run's first
+    fold starts a fresh line with a force-push (a re-issued run continues the line instead
+    only when it carries a finished prerequisite onto it, #646), and a deleted line holds
+    nothing. So fetch ``origin`` (pruned, so a deleted line stops
+    resolving here rather than leaving a stale ref) and ask ``git merge-base
+    --is-ancestor <tip> origin/<line>``: exit 0 is on the line; exit 1, a tip commit this
+    clone does not have, or a line that does not resolve is not. Any other exit, or a
+    failed fetch, is git failing, and is refused too, saying so. Nothing has been pushed
+    when this refuses."""
+    def git(*a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+
+    r = git("fetch", "--prune", "origin")
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()
+        return (f"publish: {d.name} — could not fetch origin to check that its recorded line "
+                f"tip {tip} is still on {line} ({tail[-1] if tail else 'no output'}); "
+                "nothing was pushed — fix the checkout, then retry")
+    have_tip = git("cat-file", "-e", f"{tip}^{{commit}}").returncode == 0
+    have_line = git("rev-parse", "--verify", "--quiet",
+                    f"origin/{line}^{{commit}}").returncode == 0
+    if have_tip and have_line:
+        rc = git("merge-base", "--is-ancestor", tip, f"origin/{line}").returncode
+        if rc == 0:
+            return ""
+        if rc != 1:
+            return (f"publish: {d.name} — could not tell whether its recorded line tip {tip} "
+                    f"is still on {line}: `git merge-base --is-ancestor` exited {rc}, a git "
+                    "step failed; nothing was pushed — check the checkout, then retry")
+    return (f"publish: {d.name} was built on {tip}, a commit origin's {line} no longer holds "
+            f"(a later run's first fold replaced the line, or the branch is gone) — refusing "
+            f"to cut its PR branch from it; nothing was pushed. Re-drive it in a new run "
+            f"(a re-issued run continues the line only when it carries a finished "
+            f"prerequisite onto it).")
+
+
 def _stack_base_branch(cfg: Config, d: Path) -> str | None:
-    """The branch a stacked bundle bases off (worktree + ``gh --base``), or None.
+    """The branch a stacked bundle bases off (its worktree, its PR branch), or None.
 
     The wave driver's run-scoped integration branch — recorded in the bundle's
-    ``stack-base`` file (#wave-model) — wins: a wave>0 bundle builds + opens its PR on the
-    prior waves' folded work. Else the legacy single-chain ``Stacks on:`` (#123) parent
-    branch from its publish.json, for a brief that still hand-declares a stack. None when
+    ``stack-base`` file (#wave-model) — wins: a wave>0 bundle builds on, and cuts its PR
+    branch from, the prior waves' folded work (its PR targets the real base, #593). Else
+    the legacy single-chain ``Stacks on:`` (#123) parent branch from its publish.json, for a
+    brief that still hand-declares a stack (also its own-repo ``gh --base``). None when
     neither applies (or the legacy prereq hasn't published yet)."""
-    wave_base = _read_stack_base(d)
-    if wave_base:
-        return wave_base
+    return _read_stack_base(d) or _stacks_on_branch(cfg, d)
+
+
+def _stacks_on_branch(cfg: Config, d: Path) -> str | None:
+    """A legacy ``Stacks on:`` (#123) parent's published branch, or None."""
     parents = brief.stacks_on(d / "brief.md")
     if not parents:
         return None
@@ -590,12 +749,64 @@ def _stack_base_branch(cfg: Config, d: Path) -> str | None:
     return rec.get("branch") if rec else None
 
 
+def _merge_base_refusal(cfg: Config, d: Path, repo_spec: str, pr_base: str, base: str) -> str:
+    """Why ``pr_base`` is not a base that exists independently of this run — or "" if it is.
+
+    Only consulted under ``[driver].wave_mode = "merge"`` (#411), where the driver merges
+    the PR into whatever base it carries. Two routes put another bundle's branch there,
+    and the message names BOTH branches in either:
+
+    1. ``pr_base`` differs from the bundle's own resolved target ``base`` — it came from
+       the auto-stacked chain (:func:`_stack_base_branch`: a recorded integration branch,
+       or the legacy ``Stacks on:`` parent's fix branch). Merge mode records no integration
+       branch at all (``flow`` only fills it on the stack path), so in merge mode that
+       wiring has no business choosing a base: wave order carries the dependency.
+    2. ``pr_base`` IS the bundle's resolved target base, but that base is a branch another
+       bundle in this batch produced — a brief whose ``Repo + branch target`` names a
+       predecessor's fix branch (the documented stack-mode practice). The two strings match,
+       so route 1's comparison sees nothing; the batch's ``publish.json`` records
+       (:func:`_publish_record`) are what expose it, offline.
+
+    The bundle's own base is never re-parsed here — it is passed in from
+    :func:`_resolve_target`, the one parse (#235/#262/#387).
+    """
+    fix = ('`[driver].wave_mode = "merge"` merges this PR into whatever it targets, '
+           "unattended — so it may only target a base that exists independently of this "
+           "run. Point the brief's `Repo + branch target` at the shared base, or use the "
+           'default wave_mode = "stack", where chaining onto a predecessor is correct.')
+    if pr_base != base:
+        return (f"publish: {d.name} would open its PR against `{pr_base}`, not its target "
+                f"base `{base}` — that branch is one this run produced (a `Stacks on:` "
+                f"prereq's fix branch / a recorded integration branch). {fix}")
+    producer = _batch_branch_producer(cfg, d, repo_spec, pr_base)
+    if producer:
+        return (f"publish: {d.name} would open its PR against `{pr_base}` — its own target "
+                f"base `{base}`, but that base is the branch {producer} produced in this "
+                f"batch, not a shared base. {fix}")
+    return ""
+
+
+def _batch_branch_producer(cfg: Config, d: Path, repo_spec: str, branch: str) -> str:
+    """The name of another bundle in this batch whose published branch is ``branch``
+    (in the same repo), or "". Reads the siblings' ``publish.json`` records — no network."""
+    for sub in sorted(cfg.bundle_root.glob("issue_*")):
+        if sub.resolve() == d.resolve():
+            continue
+        rec = _publish_record(sub)
+        # A record written before the `repo` field existed (or by a stub) is assumed to be
+        # this repo's — fail-closed: the refusal is recoverable, a silent wrong merge is not.
+        if rec and rec.get("branch") == branch and rec.get("repo", repo_spec) == repo_spec:
+            return sub.name
+    return ""
+
+
 def _warn_if_squash_only(repo_spec: str) -> None:
     """Warn if the target repo can't merge a stacked PR with a merge commit (issue #123).
 
-    Stacked PRs must be merged bottom-up with merge-commit / rebase-merge: a SQUASH drops
-    the parent's commits from the base, so a child retargeted to the base re-shows the
-    parent's diff until rebased. Best-effort via ``gh repo view``; any failure is silent."""
+    Stacked PRs must be merged bottom-up with a merge commit: a squash or rebase merge puts
+    the parent's change on the base as NEW commits, not the ones the child carries, so the
+    child keeps showing the parent's diff until its branch is updated from the base (#593).
+    Best-effort via ``gh repo view``; any failure is silent."""
     try:
         r = subprocess.run(
             ["gh", "repo", "view", repo_spec, "--json", "mergeCommitAllowed,squashMergeAllowed"],
@@ -625,20 +836,215 @@ def _fork_owner(repo: Path, remote: str = "origin") -> str:
     return m.group(1) if m else ""
 
 
-def _t4_passes(cfg: Config, d: Path) -> bool:
+def publish_gates(cfg: Config) -> list[dict]:
+    """The T4 rows publish is responsible for running (issue #339).
+
+    The tier alone used to select them, so registering ANY T4-tier check for Check
+    silently made publish re-run it before every push. In one instance that check was a
+    batched 3x model review of the whole ``patch.diff``: ~6 minutes, re-paid on every
+    publish attempt and every retry — and the push and ``gh pr create`` sit downstream of
+    it, so retries happen.
+
+    Duplicated cost is the smaller half. **Publish re-samples a nondeterministic reviewer
+    after the human has signed off**: a bundle green at Check can be refused at publish
+    over a finding that did not exist when §9 was recorded. Observed in both directions on
+    one bundle — two findings each seen by only 1 of 3 passes, and a re-run of the
+    identical command minutes later reporting none. That is not re-checking a decision
+    against a fixed oracle; it is drawing a fresh sample from a distribution, after the
+    decision, with the branch push gated on the result.
+
+    What the slot is actually for (this module's own docstring): checks whose subject is
+    the contribution artifacts publish just drafted — ``commit-msg.txt`` /
+    ``pr-description.md`` — which do not exist at Check time, so Check cannot have
+    validated them.
+
+    **The default is keyed on `scope`, not a flat True.** A bundle-scoped T4 row is about
+    the bundle's own artifacts, so it defaults to running here — which keeps the shipped
+    ``T4-contribution`` row gating publish, unchanged, including for an instance taking a
+    ``copier update``. A repo-scoped row cannot be about artifacts publish just drafted, so
+    it defaults off; a flat ``True`` would preserve the original defect for exactly those
+    rows, and worse, publish's environment carries only ``$PDCA_BUNDLE`` (no
+    ``$PDCA_WORKTREE``, which the Check runner exports), so a repo-scoped row depending on
+    it passes Check and then falsely blocks the push.
+
+    An explicit ``at_publish`` always wins, in both directions.
+
+    Not modelled here, and worth knowing: a check cannot yet be publish-ONLY. ``_applies``
+    knows only ``scope``/``target``, so a row whose subject is ``pr-description.md`` still
+    runs at Check — where ``pdca contribcheck`` is deliberately default-open (no
+    ``pr-description.md`` yet => pass), which is what lets one registration serve both
+    phases. A real ``phase`` property would express it directly; that is the larger change
+    #339 records for later.
+    """
+    return [c for c in cfg.gates_checks
+            if c.get("tier") == "T4"
+            and c.get("at_publish", c.get("scope", "repo") == "bundle")]
+
+
+def _t4_passes(cfg: Config, d: Path, *, pending_id: bool = False) -> bool:
     """Run every configured T4-tier gate over the bundle. No T4 gate → nothing to
-    enforce (True). Keeps publish decoupled from any one project's checker."""
-    t4 = [c for c in cfg.gates_checks if c.get("tier") == "T4"]
+    enforce (True). Keeps publish decoupled from any one project's checker.
+
+    ``pending_id`` (``--no-issue``, #384): the gate must be told which mode it runs
+    in, or the amnesty for the not-yet-assigned tracker id covers the WHOLE checker.
+    The mode is exported as ``$PDCA_PENDING_ID``, derived from THIS run's flag —
+    mirroring how the Check runner derives each gate's env from the driver's own
+    state (``gates._run_one``: ``PDCA_BRIEF_BASE`` / ``PDCA_LANE``), never inherited:
+    an ambient value is scrubbed, so a stray export from an earlier ``--no-issue``
+    run cannot relax the tracker-id rule for a ticketed publish. The shipped checker
+    honours it as ``contribcheck --no-issue`` (via the env, not an edit to the
+    registered row line — that breaks ``copier update`` for instances that appended
+    a row beside it)."""
+    t4 = publish_gates(cfg)
     if not t4:
         return True
     env = {**os.environ, "PDCA_BUNDLE": str(d)}
+    env.pop("PDCA_PENDING_ID", None)          # derived per run — never inherited (#384)
+    if pending_id:
+        env["PDCA_PENDING_ID"] = "1"
     for chk in t4:
-        r = subprocess.run(chk.get("cmd", ""), shell=True, cwd=cfg.root, env=env,
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            print((r.stdout or r.stderr).strip(), file=sys.stderr)
+        # Resolve `subcmd` through the SAME helper Check uses (#338). Reading the raw
+        # `cmd` ran the empty string for a delegated row — and `subprocess.run("")` exits
+        # 0, so a gate an instance believed it had registered passed vacuously at publish
+        # while working correctly at Check.
+        cmd, cmd_error = gates._delegated_cmd(chk, cfg.gates_runner)
+        label = f"{chk.get('id', '')}: {chk.get('label', '')}".strip(": ")
+        if cmd_error:
+            print(f"publish: T4 gate '{label}' is misconfigured — {cmd_error}",
+                  file=sys.stderr)
+            return False
+        # Heartbeat, not a bare captured run (#338): a T4 gate can be minutes of complete
+        # silence — 6m25s measured for three parallel model review passes over a 300 KB
+        # patch.diff — and on a bundle whose contribution texts already exist this is the
+        # FIRST thing publish does, so the terminal goes quiet immediately and an operator
+        # reasonably kills a working run.
+        #
+        # Deliberately NO `status=progress.bundle_activity`: that probe reports the newest
+        # write in the bundle, which suits a Do leaf or an artifact-producing Check gate. A
+        # T4 gate reads patch.diff and writes its report once, at the end, so the newest
+        # write is whatever Check left hours earlier and every tick would render
+        # "no writes 180m" — a stall warning on the very run proving it is not stalled.
+        #
+        # Announce BEFORE the heartbeat (#384, regression from the #338 rework; the
+        # #181 "reads as a hang" finding): the first tick is a full interval away, and
+        # on a bundle whose texts already exist this is publish's first action after
+        # its guards. Same shape as the peer gate runner (gates._run_one). The
+        # heartbeat label stays unprefixed — the announce already says "T4 gate".
+        print(f"  · {f'T4 gate {label}'.rstrip()} (this can take minutes)…",
+              file=sys.stderr, flush=True)
+        try:
+            rc, output, _ = progress.run_with_heartbeat(
+                cmd, cwd=cfg.root, shell=True, env=env, capture=True,
+                label=label or "T4 gate",
+            )
+        except Exception as exc:  # command not found, etc. — a failing gate, surfaced
+            print(f"publish: T4 gate '{label}' could not run — {exc}", file=sys.stderr)
+            return False
+        if rc != 0:
+            print(output.strip(), file=sys.stderr)
             return False
     return True
+
+
+def _pinned_base(repo: Path, fetch_remote: str, base_ref: str) -> tuple[str, str]:
+    """``(sha, error)`` — fetch and resolve the exact base commit the push will build on.
+
+    Runs the SAME fetch the push plan's first step runs, then resolves ``base_ref`` to a
+    commit SHA. The SHA — not the moving ref — is what the host-CI gate certifies and
+    what :func:`_pin_checkout` rebases the push onto, so "certified tree == pushed tree"
+    holds by construction (iteration-1 C5: a warm, no-fetch reconstruction certified a
+    stale base while the push fetched afterward). A non-empty ``error`` means the base
+    cannot be pinned; the caller fails closed."""
+    r = subprocess.run(["git", "-C", str(repo), "fetch", fetch_remote],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        tail = (r.stderr or "").strip().splitlines()
+        return "", f"`git fetch {fetch_remote}` failed ({tail[-1] if tail else 'no output'})"
+    r = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+                        base_ref + "^{commit}"], capture_output=True, text=True)
+    sha = (r.stdout or "").strip()
+    if r.returncode != 0 or not sha:
+        return "", f"base ref '{base_ref}' does not resolve after the fetch"
+    return sha, ""
+
+
+def _pin_checkout(steps: list[list[str]], git, branch: str, base_commit: str) -> list[list[str]]:
+    """Rebase the push plan's ``checkout -B`` step onto the exact commit host CI certified.
+
+    The plan was built against a moving ref (``<remote>/<base>``), which its own
+    ``fetch`` step would re-resolve at push time — re-opening the certified-vs-pushed
+    gap on a base that advances mid-publish (#311, iteration-1 C5). Matched on the
+    step's verbs, not a list index, so a plan reordering can't silently pin the wrong
+    step."""
+    return [git("checkout", "-B", branch, base_commit) if c[3:5] == ["checkout", "-B"]
+            else c for c in steps]
+
+
+def _host_ci_passes(cfg: Config, d: Path, repo: Path, fetch_remote: str,
+                    base_ref: str) -> tuple[bool, str]:
+    """Run the declared host-only CI commands (``[gates] host_ci``, issue #311) against
+    the exact tree the push would publish; ``(False, "")`` blocks the publish before
+    anything is pushed.
+
+    The pre-push counterpart of the Check-time host-CI rows (``gates._run_checks``) —
+    but NOT the lane reconstruction those trust: the lane is deliberately warm and
+    never fetches (``worktree.rebuild_for_gate`` — Check attests the base Do built
+    against), while the push builds on the freshly fetched base, so a lane-based run
+    can certify a stale base and still let publish push a tree the declared CI never
+    saw (iteration-1 C5). So this fetches (the same fetch the push plan runs), PINS
+    the resolved base commit, materializes an ephemeral ``base + patch.diff`` tree at
+    that commit (``worktree.for_publish``), runs the commands there, and returns the
+    pinned SHA so the push's ``checkout -B`` builds on it — certified tree == pushed
+    tree, by construction.
+
+    Nothing declared ⇒ ``(True, "")`` with no work at all — an instance that opts out
+    is byte-identical to today (criterion c). EVERY command that does not pass blocks
+    the push — including exit 77 (a Check gate's "cannot decide" channel) and any row
+    hand-marked non-gating: the #311 criterion is literal ("a command that exits
+    non-zero … blocks publish — no branch is pushed, no PR is opened"), the host's CI
+    will fail the PR on these commands regardless of a carve-out, and sign-off did not
+    bless one (iteration-1 C3). A refusal names the command on stderr and records
+    every row plus the pinned base in the bundle's ``host-ci.json`` (removed again
+    once they pass). Fail CLOSED when the base can't be pinned or no tree can be
+    materialized — pushing content the declared CI never saw is the exact blind spot
+    this closes."""
+    if not cfg.host_ci_checks:
+        return True, ""
+    record = d / HOST_CI_JSON
+
+    def _refuse(reason: str, rows: list[dict], base: str = "") -> tuple[bool, str]:
+        record.write_text(json.dumps({"overall": "fail", "reason": reason,
+                                      "base": base, "rows": rows},
+                                     indent=2) + "\n", encoding="utf-8")
+        print(f"publish: host CI gate — {reason} — nothing was pushed, no PR was "
+              f"opened; see {d.name}/{HOST_CI_JSON}.", file=sys.stderr)
+        return False, ""
+
+    sha, err = _pinned_base(repo, fetch_remote, base_ref)
+    if not sha:
+        return _refuse(f"cannot pin the base commit the push would build on — {err}", [])
+    try:
+        wt = worktree.for_publish(d, repo, sha)
+    except worktree.WorktreeError as exc:
+        return _refuse(f"no pushed-tree to run against ({exc})", [], base=sha)
+    rows: list[dict] = []
+    try:
+        for chk in cfg.host_ci_checks:
+            rows.append(gates._run_one(chk, cfg=cfg, cwd=wt, bundle=d,
+                                       runner=cfg.gates_runner, worktree_path=wt))
+    finally:
+        worktree.overflow_remove(repo, wt)
+    failed = [r for r in rows if r["result"] != "pass"]
+    if failed:
+        for r in failed:
+            print(f"publish: host CI '{r['rule_id']}' did NOT pass against the pinned "
+                  f"base + patch.diff ({r['result']}) — command: {r['oracle']}\n"
+                  f"    {r['path_line']}", file=sys.stderr)
+        return _refuse(f"{len(failed)} host CI command(s) did not pass against the "
+                       f"tree the push would publish (base {sha[:12]} + patch.diff) — "
+                       "fix the tree (or the command) and retry", rows, base=sha)
+    record.unlink(missing_ok=True)
+    return True, sha
 
 
 def _check_repo(repo: Path, repo_spec: str, required_remotes=("upstream", "origin")) -> int:

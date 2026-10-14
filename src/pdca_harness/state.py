@@ -9,6 +9,7 @@ and inspectable (``ls`` answers the question).
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from . import brief, signoff
@@ -30,10 +31,147 @@ RESOLVED = "RESOLVED"  # briefless tracker bundle; notes.json records a terminal
 # States where the driver does nothing (human work, or done).
 HALTED = {UNPLANNED, AWAITING_SIGNOFF, COMPLETE, DISCONTINUED, RESOLVED}
 
+# Terminal-FINISHED states (issue #317): the cycle is over and the bundle's files are
+# final — accepted (COMPLETE), deliberately abandoned (DISCONTINUED), or settled in the
+# tracker outside a cycle (RESOLVED). Deliberately NOT the whole HALTED set: UNPLANNED
+# and AWAITING_SIGNOFF are halted FOR a human — work is pending and the files still
+# change. Defined here, in the one module that owns the state names, so a consumer
+# (`record` selects on this) never re-enumerates states and drifts.
+TERMINAL = frozenset({COMPLETE, DISCONTINUED, RESOLVED})
+
 # Close-disposition fast path (issue #60): a bundle whose Plan concluded a close /
 # no-fix outcome never builds a patch. Its close marker is the Do artifact — the
 # symmetric stand-in for patch.diff — so the state machine reads it as "past Do".
 CLOSE_MARKER = "close-disposition"
+
+# Do-exit dependency adjudication record (issue #341): how the driver adjudicated a
+# builder-declared unmet external dependency at BUILT (confirmed ⇒ the beat rerouted to
+# the close fast path; refuted ⇒ full Check ran, the refutation lifted into §6). Named
+# here, like CLOSE_MARKER, so `dependency_halt` and the archive list share one spelling.
+DEPENDENCY_ADJUDICATION = "dependency-adjudication.json"
+
+# The sign-off session's live carry-forward (issue #331): the FULL multi-line rationale
+# the session wrote below its decision token, captured by the driver (flow) at the moment
+# the decision is consumed — §9's "Iteration delta" flattens it to one line and the
+# decision file itself is unlinked, so without this capture the only structured copy is
+# destroyed before the iterate transition reads it. Consumed (merged into the brief's
+# carry-forward block) by driver._carry_forward_into_brief, then archived with its
+# attempt via DOWNSTREAM_OF_BRIEF below.
+SESSION_CARRY = "session-carry-forward"
+
+# The reviewer leaf's captured-error tail (#138): each failed attempt's record is written
+# as that attempt happens (#540) and the record is SETTLED once the attempts are spent —
+# which makes it, SETTLED, the discriminator (#369) between a reviewer that ran-and-failed
+# and one that NEVER ran (an interrupted beat), since neither leaves a check-review.md.
+# Named here (like CLOSE_MARKER) so the writer (``leaves``), the CHECKED-resume check
+# (``driver``) and the §6 wording split (``assemble``) share one spelling. What a given
+# log MEANS is :func:`leaf_ran_and_failed` below — never the path's existence.
+REVIEW_ERROR_LOG = "check-review.error.log"
+
+# The settlement marker (#540) — the ONE point of truth for what an ``*.error.log`` means,
+# and what makes it safe for one to exist before its leaf has finished.
+#
+# ``leaves._invoke_leaf_resilient`` writes each failed attempt's record BEFORE the next
+# attempt starts, so a run killed inside the retry loop still leaves a post-mortem (it used
+# to write nothing until the loop ended, so a mid-retry death lost every attempt's account
+# and a leaf observing the bundle during attempt 2 found nothing about attempt 1). The
+# file's mere PRESENCE therefore cannot carry the old sentence any more: a record whose
+# leaf still has attempts left is emphatically NOT "the leaf ran and FAILED".
+#
+# So settlement is asserted POSITIVELY: the harness ends a spent leaf's record with this
+# line, and :func:`leaf_ran_and_failed` is exactly "the last non-blank line is this marker,
+# alone". Every other shape — absent, empty, unreadable, unfinished, a record a dead write
+# tore off part-way, one written by an older harness — answers False and the leaf is RE-RUN.
+# That direction costs one leaf run; the other one costs the review itself (a reviewer the
+# death window merely INTERRUPTED, retired as if it had failed, and a bundle reaching
+# sign-off with no review of the diff at all). Four readers, one sentence, so none of them
+# can be left speaking the old meaning: ``leaves.review_never_ran``,
+# ``leaves.run_advisory_leaves(only_missing=True)``, ``assemble._missing_review_text`` and
+# ``driver._resume_interrupted_check``.
+ATTEMPTS_SPENT_MARKER = "----- attempts spent: this leaf ran and FAILED -----"
+
+# The line an UNFINISHED record ends with. Prose for whoever opens the file mid-retry, not
+# a discriminator: nothing reads it (the question is only ever "does the marker above end
+# this file"), so a leaf that prints this line changes nothing.
+_UNFINISHED_TRAILER = ("----- attempts NOT yet spent: the leaf was still retrying when this "
+                       "record was written -----")
+
+# What a marker-shaped line out of a LEAF's own mouth is rewritten to (see
+# :func:`neutralize_leaf_text`). Kept beside the marker: they are one decision.
+_QUOTED_SUFFIX = "(quoted from the leaf's own output — not the harness's marker)"
+
+# The per-rule gate evidence logs (issue #370): ``gate-logs/<rule_id>.log`` — the full
+# combined output behind each ``check-gates.json`` row, written by a bundle-scoped
+# ``gates.run_gates``. Named here (like CLOSE_MARKER / SESSION_CARRY) so ``gates`` (the
+# writer) and the archive list below share one spelling.
+GATE_LOGS_DIR = "gate-logs"
+
+# Everything Do and Check write, i.e. everything downstream of brief.md. Includes the
+# close marker (issue #60) so an iterate archives it too — reopening a close bundle to a
+# fix path then clears the marker and runs the real Do+Check band.
+#
+# Lives here rather than in `driver` (#334) because `is_resolved` must read it and
+# `driver` already imports this module — the other direction would be a cycle. `driver`
+# re-exports the name, so `driver.DOWNSTREAM_OF_BRIEF` still resolves.
+DOWNSTREAM_OF_BRIEF = [
+    "patch.diff",
+    "build-notes.md",
+    CLOSE_MARKER,
+    "MANUAL-VERIFICATION.md",
+    "check-gates.json",
+    "check-gates.md",
+    "check-review.md",
+    "SUMMARY.md",
+    # The rubric snapshot (#314): a Do/Check-era artifact, so an iterate archives it and
+    # the rebuild takes a fresh one — a rubric that changed between attempts SHOULD apply
+    # to the next.
+    "rubric-snapshot.md",
+    # The empirical size measurement (#324). Same reasoning, plus a sharper one: it is
+    # measured FROM patch.diff, which this list archives. Left behind it would describe an
+    # attempt that is no longer there — and the archive of a rejected attempt would lack
+    # the very numbers that justified rejecting it. Not in CYCLE_EVIDENCE_ONLY: unlike the
+    # auto-iterate budget it does not accumulate, it is rewritten wholesale each Check.
+    "size-signal.json",
+    # The Do-exit dependency adjudication (#341). A Do/Check-era verdict about THIS
+    # attempt's build-notes.md, so an iterate archives it with the attempt and the
+    # rebuild is adjudicated fresh — a stale record left behind would describe a
+    # declaration the new build-notes.md may no longer make.
+    DEPENDENCY_ADJUDICATION,
+    # The captured sign-off-session carry-forward (#331): written by flow when the
+    # decision is consumed, merged into the brief by _carry_forward_into_brief, and
+    # archived here WITH the attempt it describes — never left to leak into the next one.
+    SESSION_CARRY,
+    # The gate evidence logs (#370): a directory, one <rule_id>.log per configured check.
+    # Archived per round WITH the verdict they explain, so each iteration-v<N>/ keeps the
+    # full basis of its own gate run — the state-is-files doctrine applied to evidence.
+    GATE_LOGS_DIR,
+]
+
+# Cycle artifacts matched by pattern rather than name. ONE definition, read by both
+# `_archive_iteration` (what an iterate moves) and `is_resolved` (what counts as evidence
+# a cycle ran), so those two answers cannot drift apart. `*.memory.jsonl` is a leaf run's
+# scope telemetry (`leaves._MemoryTelemetry`): per-attempt like its `*.error.log` twin, so
+# it archives with the round it describes — and a bundle can only hold one if a leaf ran.
+DOWNSTREAM_GLOBS = ("check-advisory-*.md", "*.error.log", "*.memory.jsonl")
+
+# Cycle evidence that must NOT be archived — the one set where "what the archive moves"
+# and "what proves a cycle ran" deliberately differ, so it is deliberately NOT read by
+# `_archive_iteration`.
+#
+# Each file accumulates ACROSS rebuilds by design, and archiving any of them breaks the
+# feature that depends on the accumulation:
+#   auto-iterate.json      — the round budget; archive it and the count resets every
+#                            iterate, so auto-iterate never terminates.
+#   loop-telemetry.json    — `leaves._record_loop_attempt`: "The file persists across
+#                            iterations (it is not archived), so it accumulates."
+#   deferred-findings.json — `autoiterate.DEFERRED_FILE` (#409): the HUMAN findings an
+#                            auto-iterate round iterated past. Archive it and every one of
+#                            them leaves the live bundle with the SUMMARY that carried it,
+#                            so the handover §6 would never show it to the human.
+# Yet a bundle cannot hold any of them without having run a cycle, so each is unambiguous
+# evidence. Adding them to DOWNSTREAM_OF_BRIEF instead would fix the misclassification
+# below and break termination, which is the worse bug.
+CYCLE_EVIDENCE_ONLY = ("auto-iterate.json", "loop-telemetry.json", "deferred-findings.json")
 
 # §9 outcome token → bundle state. state owns the state names, so the mapping
 # lives here; signoff knows only the tokens (no import cycle).
@@ -44,6 +182,72 @@ _OUTCOME_TO_STATE = {
     "iterated-to-Plan": ITERATE_PLAN,
     "discontinued": DISCONTINUED,
 }
+
+
+def leaf_ran_and_failed(error_log: Path) -> bool:
+    """True iff ``error_log`` is the SETTLED account of a leaf that SPENT its attempts.
+
+    The engine's one failed-leaf discriminator (#138 / #369 / #540) — see
+    :data:`ATTEMPTS_SPENT_MARKER` for why every reader asks this instead of testing the
+    path's existence, and why every ambiguous shape answers False: absent, empty,
+    unreadable, unfinished, torn off part-way by a dead write, or written by an older
+    harness all fail towards RE-RUNNING the leaf. A needless re-run costs a leaf; the
+    opposite error costs the review of the diff.
+    """
+    try:
+        text = error_log.read_text(encoding="utf-8", errors="replace")
+    except OSError:  # absent, unreadable, a directory — no settled account either way
+        return False
+    return _last_nonblank(text) == ATTEMPTS_SPENT_MARKER
+
+
+def _last_nonblank(text: str) -> str:
+    """``text``'s last non-blank line, stripped — ``""`` when it has none.
+
+    The marker is read here and nowhere else, and only as a WHOLE final line:
+    deliberately not a substring or mid-line test, because these records embed each failed
+    attempt's captured stderr verbatim, so a looser rule would let a leaf's own output
+    settle the harness's account of the leaf's own run. The writer side of that pair is
+    :func:`neutralize_leaf_text`.
+    """
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def settled_record(records: str) -> str:
+    """``records`` marked SETTLED — the form that reads as "the leaf ran and FAILED",
+    written once the attempts are spent."""
+    return records + ATTEMPTS_SPENT_MARKER + "\n"
+
+
+def unfinished_record(records: str) -> str:
+    """The attempts SO FAR — what a leaf's error log holds BETWEEN attempts. It carries no
+    settlement marker, so every reader treats it exactly as it treats an absent log."""
+    return records + _UNFINISHED_TRAILER + "\n"
+
+
+def neutralize_leaf_text(text: str) -> str:
+    """A leaf's captured output with any line that would read as
+    :data:`ATTEMPTS_SPENT_MARKER` defused, so a leaf cannot settle the harness's account of
+    the leaf's own run.
+
+    The records embed captured stderr verbatim; the marker is only ever read as a record's
+    last non-blank line, so the exposure is narrow but real — a record cut short right
+    after such a line (a torn write, an older harness's file) would read as spent and
+    retire a leaf that was only interrupted. Only a line that IS the marker (bar
+    surrounding whitespace) can be read as one, so only such a line is rewritten — and it
+    is rewritten, never dropped: the text stays in the post-mortem, including anything
+    riding the same channel (the #420 memory telemetry), it simply can no longer BE the
+    marker.
+    """
+    if ATTEMPTS_SPENT_MARKER not in text:
+        return text
+    out = "\n".join(f"{line} {_QUOTED_SUFFIX}" if line.strip() == ATTEMPTS_SPENT_MARKER
+                    else line
+                    for line in text.splitlines())
+    return out + "\n" if text.endswith("\n") else out
 
 
 def is_resolved(d: Path) -> bool:
@@ -62,19 +266,93 @@ def is_resolved(d: Path) -> bool:
         data = json.loads(notes.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return False
-    return isinstance(data, dict) and isinstance(data.get("resolved"), dict)
+    if not (isinstance(data, dict) and isinstance(data.get("resolved"), dict)):
+        return False
+    # RESOLVED is terminal: the bundle leaves the resume set and `do_plan` returns early
+    # rather than briefing it (#302). So a marker arriving while a cycle is IN FLIGHT —
+    # a stale scrape, a tracker item closed as a duplicate, a human closing the ticket
+    # while the fix is being built — must not settle it. The docstring's "callers scope
+    # this to BRIEFLESS bundles" is not a guard the caller can honour: an iterate-to-Plan
+    # ARCHIVES brief.md, so a bundle mid-cycle with a full iteration history is briefless
+    # too. Decide it here, from evidence on disk (#334).
+    return not has_cycle_evidence(d)
+
+
+def has_cycle_evidence(d: Path) -> bool:
+    """True if anything in the bundle proves a cycle actually ran (issue #334).
+
+    Only a genuinely notes-only bundle can be RESOLVED. Every other artifact class means
+    work happened that a terminal marker would silently abandon — and the failure is
+    silent in the direction that costs most: the bundle drops out of the resume set and
+    Plan skips it, so a cycle with real iteration history ends with nothing reported.
+    """
+    bp = d / "brief.md"
+    if bp.exists() and not brief.is_placeholder(bp):
+        # An AUTHORED brief only. An unfilled template copy is "never authored" — the same
+        # standing as no brief at all — so the tracker's resolution still wins there
+        # (#302 review), which `test_placeholder_brief_does_not_unresolve_a_resolved_tracker`
+        # locks. Read via `whole_field`, so a Slug written beneath its label is recognised
+        # as authored rather than mistaken for a template (#336).
+        return True
+    if any((d / name).exists() for name in DOWNSTREAM_OF_BRIEF):
+        return True
+    if any((d / name).exists() for name in CYCLE_EVIDENCE_ONLY):
+        return True
+    if any(next(d.glob(pattern), None) for pattern in DOWNSTREAM_GLOBS):
+        return True
+    return next(d.glob("iteration-v*"), None) is not None
+
+
+#: `iteration-v<N>` — the directory `driver._archive_iteration` moves an attempt into.
+_ITERATION_DIR = re.compile(r"^iteration-v(\d+)$")
+
+
+def iteration_archives(d: Path) -> list[tuple[int, Path]]:
+    """``(N, d / "iteration-v<N>")`` for each attempt archive, oldest first.
+
+    The one place an archive's name is parsed for its N (#481 review):
+    `size_signal.iteration_rounds` and `split` both read the archives here and through
+    :func:`replan_archives`, because a private copy in each could drift apart unnoticed.
+    Ordered by N as a NUMBER — as text, ``iteration-v10`` sorts before ``iteration-v2`` —
+    and only a directory counts: a stray file with an archive's name is not one.
+    """
+    found = []
+    for a in d.glob("iteration-v*"):
+        m = _ITERATION_DIR.match(a.name)
+        if m and a.is_dir():
+            found.append((int(m.group(1)), a))
+    return sorted(found)
+
+
+def replan_archives(d: Path) -> list[tuple[int, Path]]:
+    """The archives an iterate-to-Plan wrote — those holding a ``brief.md`` — oldest first.
+
+    An iterate-to-Do archives the attempt and keeps the brief; an iterate-to-Plan archives
+    the brief with it (``driver._archive_iteration(include_brief=True)``). So each of these
+    marks a re-plan, and the LAST one holds the brief the bundle was last planned from:
+    the boundary `size_signal.iteration_rounds` counts rounds after, and the brief `split`
+    rebuilds a briefless parent's Plan artifact from (#481).
+    """
+    return [(n, a) for n, a in iteration_archives(d) if (a / "brief.md").is_file()]
 
 
 def state(d: Path) -> str:
     """Return the bundle's state from the files present (docs 03 §state)."""
     bp = d / "brief.md"
-    if not bp.exists():
-        # No brief ever authored — pending Plan, unless the tracker itself settled the
-        # question (a notes-only bundle with a `resolved` record is terminal, #302).
-        return RESOLVED if is_resolved(d) else UNPLANNED
     # Do is done when there's a patch — OR, on the close-disposition fast path, the
     # close marker that stands in for it (a close bundle never builds a patch.diff).
+    #
+    # Asked BEFORE the brief is looked at (issue #481). A bundle carrying either artifact
+    # is past Do (the CLOSE_MARKER contract above), and a missing brief.md cannot move it
+    # back before Plan: briefless is not "never planned" (#334 — `is_resolved` reads cycle
+    # evidence the same way). Asked the other way round, a split parent whose brief an
+    # iterate-to-Plan had archived read UNPLANNED while already terminal, and every flow
+    # reopened a Plan session with nothing left to decide.
     if not (d / "patch.diff").exists() and not (d / CLOSE_MARKER).exists():
+        if not bp.exists():
+            # No brief ever authored — pending Plan, unless the tracker itself settled
+            # the question (a notes-only bundle with a `resolved` record is terminal, #302).
+            return RESOLVED if is_resolved(d) else UNPLANNED
         # Pre-Do only: a brief that's still an unfilled template (Slug missing / a `<…>`
         # placeholder) means the planner never authored it, so treat it as UNPLANNED and
         # let the Plan beat re-plan it instead of being skipped (issue #113). Scoped to

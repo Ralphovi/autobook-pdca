@@ -131,12 +131,102 @@ reviewer's C5 symptom-guard smell-test, moved to where the error starts. Keep it
 category-gated; a category graduates to an unconditional gate only on evidence
 (`docs/principles.md` §8).
 
+## If the slice is too big, split it HERE — the whole split happens in this beat
+
+A split produces briefs, and authoring briefs is your beat. Nobody downstream can do it:
+Do builds what it is given, and Check can only report that the thing it built is
+misshapen. So the decision belongs in this session, while you have the issue open.
+
+The driver sizes every slice before Do and prints its verdict. Treat `oversized` as a
+prompt to look, not an instruction to obey — it is a heuristic, and the human in this
+session is the one deciding.
+
+When the answer is "yes, this is several slices":
+
+```
+pdca-autobook split <id>              # the splitter drafts split-proposal.md — children, with
+                             # their inter-child `Depends on:` / `Conflicts with:`
+                             # …read it with the human, edit it if it is wrong…
+pdca-autobook split <id> --accept     # files one tracker issue per child as a SUB-ISSUE of this
+                             # one, materialises a bundle per child, marks this parent
+                             # split, and prints a `pdca-autobook flow …` line: a CONDITION
+                             # ("drives them if it reaches them") while a live flow still
+                             # holds this parent, today's plain instruction otherwise
+```
+
+You do **not** leave the session to file issues by hand. `--accept` does it (pass `--ids`
+instead only when the issues already exist, or when the tracker is not one the driver can
+reach — it will say so plainly rather than skipping).
+
+The parent's tracker issue **stays open** while its children are worked on: `--accept`
+neither closes nor labels it. Once the parent's bundle is COMPLETE and every child issue
+is closed, `pdca-autobook cleanup --apply` closes it with a comment naming every child —
+as completed if at least one child was completed, else as not planned. Only a COMPLETE
+parent waits for its children: one whose bundle ends DISCONTINUED is closed as not planned
+like any other discontinued bundle.
+
+`--accept` refuses a bundle that is already two splits deep (its lineage record says
+depth 2 or more): a slice that deep is meant to be built or dropped, not split again.
+`--force` overrides that refusal, and it is the human's decision, not yours. Do not pass
+`--force` unless the human has asked for it in so many words; when the refusal appears,
+show it to the human and stop there.
+
+What happens next no longer depends on how this run was started:
+
+- **The run you are in adopts them.** A bundle that reaches `close-disposition = split`
+  while a flow is driving it has its children read from the split's lineage record and
+  spliced into the waves *after* its own — independent ones in parallel, dependent ones
+  stacked — and driven in the same run. That holds for every shape: a CSV-driven batch
+  (`pdca-autobook flow --csv …`), an explicit list like `pdca-autobook flow 500 501`, and a
+  single `pdca-autobook flow <id>`. Nothing further is needed from you.
+- **Every wave the split creates is funded, none of them twice.** `max_passes` is the
+  allowance one wave gets, and the run's pool holds one per wave its schedule currently
+  has — re-sized when a split grows it, so an adopted wave is neither starved by
+  arithmetic done before it existed nor handed a second allowance. Whatever a wave does
+  not finish is named on stderr with the command that resumes it.
+- **A child the run could not schedule is held, not dropped.** One whose declared
+  `Depends on:` cannot be resolved is named on stderr and left in flight; resolve it and
+  re-run that one.
+- **A split an earlier run left behind is recovered by naming the parent.** If the run that
+  accepted the split ended before its children were driven, `pdca-autobook flow <parent-id>`
+  picks them up — the parent is still skipped as finished, its children (and theirs, through
+  a generation that already closed) are adopted into that run.
+- **`--accept` never promises more than a live run can guarantee.** While a run holds this
+  parent — driving it, or holding it as a recovery seed, in this very session or from
+  another shell — the line says the run drives the children *if it reaches them*, and that
+  it lists any it did not when it ends. It never says "will drive" and it prints today's
+  plain `pdca-autobook flow <child-ids>` instruction the rest of the time: standalone, once
+  that run has ended, or for a child a run already let go.
+- **A run names every split child it leaves IN FLIGHT, when it ends.** Not just the one this
+  `--accept` just produced: any split anywhere in the run's own drive set — including one
+  accepted from another shell on a bundle the run has already walked away from — is
+  checked again right before the run stops, and every child still unfinished is named there
+  with the `pdca-autobook flow <child-ids>` command that resumes it. A child an earlier run
+  already finished is passed over in silence (the list is work nothing will drive, not work
+  nobody needs to); a child that is itself a split is passed over too, but the walk goes
+  THROUGH it to the generation below.
+
+Either way the `Depends on:` / `Conflicts with:` fields between children are what makes the
+scheduling work, which is why they are the part to get right.
+
+**Prefer fewer, larger children.** Each costs a full cycle, so a split into six that could
+have been two is its own kind of oversizing.
+
+**If the oversize is discovered later** — the patch arrives and Check will not converge —
+the route back here is `iterate-plan` at sign-off, which archives the attempt and returns
+the bundle to Plan. Not `iterate-do`: a rebuild cannot make two outcomes into one, and the
+findings look implementation-shaped every round while the budget drains. The split is then
+authored here, on a fresh brief.
+
 ## Boundaries
 
 Plan authors the brief and nothing else. Do **not** write `patch.diff`, run the
 fix, or pre-judge the outcome — that is Do and Check. If the right scope isn't
 clear from the documents and the human, say so and stop; an underspecified brief
 is worse than none.
+
+Splitting is the one exception, and it is not really one: a split *is* brief authoring —
+several briefs instead of one — which is why it belongs to this beat and not to a later.
 
 ## Verify before you hand off (every brief, unprompted)
 
@@ -206,7 +296,7 @@ run it per `brief.md`, and run the file-set-vs-wave-order check across the batch
 
 ## Ending the session
 
-You are one beat of an automated flow (`pdca flow`): once `brief.md` is written, **verified
+You are one beat of an automated flow (`pdca-autobook flow`): once `brief.md` is written, **verified
 (above)**, and the human is satisfied, **your job is done**. Do not tell the human to run any
 `pdca` / driver command — the flow continues to **Do automatically** as soon as
 this session ends. Conclude with one line confirming the brief is written and that
