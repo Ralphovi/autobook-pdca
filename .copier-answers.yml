@@ -19,7 +19,7 @@ project_license: Apache-2.0
 project_name: Autobook PDCA
 project_slug: autobook-pdca
 reviewer_family: codex
-ship_ci_workflow: false
+ship_ci_workflow: true
 ship_merge_guard: true
 tracker_system: github
 tracker_url: https://github.com/Ralphovi/autobook

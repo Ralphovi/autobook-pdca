@@ -1,5 +1,26 @@
 # engine/ — the verification engine for Autobook PDCA
 
+## This instance (Autobook)
+
+| Gate | Script | Gating | What it proves |
+|---|---|---|---|
+| C4-ci | `nox.sh gate` | yes | Autobook's whole gate (fmt, lint, types, pytest, typos, docs lint) on the patched worktree. Repo-scoped; reports unverifiable in CI, where there is no Autobook checkout |
+| C4-verify | `scripts/run-verify.sh` | yes | The bundle's test is red with the production hunks reverted and green with them, judged by pytest's exit code **and** the tests that actually ran (`scripts/lib/junit_count.py`, from JUnit XML). Applier tests are deselected |
+| T4 | `../scripts/pdca contribcheck` | yes | Commit message and PR description shape |
+| T2 | `scripts/check-threat-model-touch.sh` | no | A patch touching security-relevant paths also updates `../autobook/.oss-scanner/threat_model.md`; otherwise §6 |
+
+- `scripts/install-target-deps.sh` is `[install].extra_bootstrap`: it installs nox, pytest
+  and Autobook's dependencies into `.venv`, never Autobook itself, so tests always import
+  the worktree's `src/` (`run-verify.sh` sets `PYTHONPATH`; Autobook's pytest config does
+  not). `nox.sh` falls back to `.venv/bin/nox` when `nox` isn't on PATH.
+- Each pytest run gets a fresh, empty bytecode cache (`PYTHONPYCACHEPREFIX`). Python trusts
+  a cached `.pyc` whose source kept its size and mtime second, which a one-character revert
+  does — without this the red leg can run the green leg's code.
+- Engine tests: `.venv/bin/python3 -m unittest discover -s engine/tests` — one case per
+  row of the C4 truth table, against a throwaway pytest project shaped like Autobook.
+- Ported from eduralph/nl-shell-pdca (autobook-pdca#3). nl-shell's T3 `run-suite.sh` is
+  not: C4-ci already runs Autobook's whole suite through nox.
+
 This directory holds the **project-specific verification engine**: the runners,
 helpers, and tooling the PDCA cycle invokes to *reproduce* a defect and *verify* a
 fix. It is the home that `pdca.toml` `[[gates.checks]]` `cmd`s and the
