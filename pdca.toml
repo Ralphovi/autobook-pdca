@@ -41,7 +41,7 @@ templates_dir = "templates"
 # only N copies, not one per bundle. Leave at 1 unless per-lane disk / sign-off
 # ergonomics actually bite (then prefer this over N separate workspaces).
 [driver]
-lanes = 1
+lanes = 3
 # Sign-off pass budget for one `pdca-autobook flow` run (issue #260): how many build-all → sign-off
 # passes a wave gets (and how many iterations a single issue gets) before the driver stops
 # driving it. A hard bundle can legitimately need many sign-off iterations; when the budget
@@ -73,7 +73,7 @@ max_passes = 20
 # (the empirical size thresholds further down, whose `rounds` rule fires before this cap on
 # purpose) and `max_auto_iters` rounds per bundle (clamped below max_passes). On either the
 # bundle halts for you as before. `PDCA_AUTO_ITERATE=1` / `--auto-iterate` override.
-auto_iterate = false
+auto_iterate = true
 max_auto_iters = 3
 # Worktree isolation (issue #94). A cycle's Do/Check run in a dedicated git worktree off
 # the target's base, so the host's primary checkout is NEVER mutated in place. The harness
@@ -96,7 +96,7 @@ worktree = true
 # unless you actually run out-of-band gate/verify reads against in-flight lanes (the common
 # serial / one-bundle-per-lane flow never contends, so 0 costs nothing). Each overflow is a
 # full checkout — size the cap to your disk headroom; spillover is logged when it happens.
-overflow = 0
+overflow = 1
 # Per-lane resource preflight (issue #213). A `lanes > 1` batch pins each bundle to a lane
 # slot and exports `$PDCA_LANE`; the instance's gate commands map that to a per-lane resource
 # (a worktree, a container, a port). This verifies those resources exist ONCE, before the
@@ -501,6 +501,13 @@ interactive = false
 # Role prompt: canonical body agents/builder.md. Claude resolves it via the baked
 # `--agent builder`; codex (no agent flag) has it inlined into the prompt.
 agent = "builder"
+# Attempt 1 runs sonnet; the escalation ladder below takes over from attempt 2. Do is the
+# bulk consumer here — it reruns under [driver].auto_iterate (up to max_auto_iters rounds)
+# across 3 lanes — so this is the one leaf where a cheap first pass is worth having.
+# `model`/`effort` are mapped through the family profile onto --model/--effort; they apply
+# because argv names neither (an explicit flag in argv always wins).
+model = "sonnet"
+effort = "high"
 argv = ["claude", "-p", "--agent", "builder", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
 
 # Builder escalation ladder (issue #135) — optional. A bundle that fails Check and
@@ -511,9 +518,47 @@ argv = ["claude", "-p", "--agent", "builder", "--permission-mode", "acceptEdits"
 # from [leaves.builder]. Iterations-to-pass + which backend ran each pass (family plus the
 # effective model/effort, so a ladder INSIDE one vendor stays readable) land in the
 # bundle's loop-telemetry.json — the go/no-go metric for adopting a cheaper local builder.
-# [[leaves.builder_escalation]]
-# min_iteration = 2          # 2nd attempt onward → a stronger model
-# argv = ["claude", "-p", "--agent", "builder", "--model", "opus", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
+# ACTIVE — escalate from attempt 2. Without a ladder an iterated bundle re-runs the SAME
+# model and tends to re-fail the same way until you discontinue it. Inherits every field it
+# omits from [leaves.builder], so only the delta is declared here. Which backend ran each
+# pass, and iterations-to-pass, land in the bundle's loop-telemetry.json — read that before
+# deciding whether sonnet-first is earning its keep.
+#
+# THE LADDER IS INDEPENDENT OF auto_iterate, by construction and deliberately. It keys on
+# `attempt_no` — the count of `iteration-v*` archives + 1 — and that archive is written by the
+# driver's ITERATE_DO state handler, which is reached identically whether auto-iterate
+# recorded the decision or YOU did at sign-off. So escalation measures ONE thing: how many
+# times this bundle has failed Check. It does not know, and must not care, what drove the
+# rebuild. Turning auto_iterate off, or changing max_auto_iters, does not move a single rung.
+#
+# THE CLI MODEL GOES IN argv HERE, not in a `model` key. In an escalation/variant spec
+# `model` is the issue-#167 SELECTOR name a brief pins via `- **Do model:** <name>`, and
+# `_leaf_from_spec` deliberately inherits the profile-mapped CLI model from [leaves.builder]
+# instead (`model=default.model`). A `model = "opus"` key here would therefore be read as a
+# selector, silently leave attempt 2 on the builder's sonnet, and the ladder would do
+# nothing — a green-looking config that never escalates. `effort` IS read from the spec.
+[[leaves.builder_escalation]]
+min_iteration = 2
+effort = "high"
+argv = ["claude", "-p", "--agent", "builder", "--model", "opus", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
+
+# Top rung — opus at MAX effort from attempt 4. The threshold is stated in the ladder's own
+# terms: a bundle reaching attempt 4 has failed Check THREE times, twice of them already on
+# opus/high. It is therefore not failing for want of reasoning budget at that tier, and the
+# alternative to spending more is a bundle nobody solved. Rare by construction.
+#
+# Deliberately NOT expressed as "the last unattended attempt". That would peg this rung to
+# max_auto_iters and make it dead config the moment auto-iterate is turned off or its budget
+# lowered — when in fact a human's iterate-do reaches attempt 4 and beyond just the same.
+# Change max_auto_iters freely; this rung is unaffected.
+#
+# `select_builder` takes the entry with the HIGHEST min_iteration <= the attempt, so the two
+# rungs compose regardless of declaration order. Same rule as above — the CLI model lives in
+# argv; only `effort` is read from the spec.
+[[leaves.builder_escalation]]
+min_iteration = 4
+effort = "max"
+argv = ["claude", "-p", "--agent", "builder", "--model", "opus", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Edit,Write,Bash,Grep,Glob"]
 # Difficulty-routed builder variants (issue #134) — optional. Route the Do backend per
 # bundle from the brief's `Difficulty` field (the planner's blast-radius assessment, #133),
 # so a cheap local model handles easy bundles and a stronger one is reserved for the hard
@@ -598,6 +643,12 @@ interactive = false
 # Role prompt: canonical body agents/reviewer.md, inlined for codex / resolved via
 # `--agent reviewer` for claude. (AGENTS.md now carries general codex project context.)
 agent = "reviewer"
+# STAYS CODEX. Cross-vendor decorrelation is the only independent read Check gets on the
+# builder's evidence, and with the adversary on claude, Check spans both vendors. Effort is
+# pinned because an under-reasoning reviewer rubber-stamps — the failure mode is a PASS, not
+# a visible error. Mapped through the codex profile to `-c model_reasoning_effort=high`;
+# `model` is left unset so it follows the codex account default.
+effort = "high"
 # `codex exec --sandbox workspace-write` — the reviewer re-runs red/green evidence
 # (git stash/unstash) and re-checks path:line on $PDCA_TARGET, which the driver grants as a
 # writable root via the family's --add-dir grounding. The role prompt forbids writing the FIX.
@@ -648,6 +699,14 @@ mode = "command"
 family = "claude"
 interactive = true
 agent = "planner"
+# THE HIGHEST-LEVERAGE LEAF, and the cheapest place to buy capability: one interactive call
+# per issue, against a Do that may rerun four times across three lanes. It is also the only
+# leaf whose error no downstream gate can recover — docs/principles.md §3/§4: a success
+# criterion narrow enough to be met by guarding one module lets the wrong fix pass Check,
+# and no gate can reconstruct the right invariant from a wrong one. So it gets the strongest
+# model at high effort while the builder starts on sonnet.
+model = "opus"
+effort = "high"
 argv = ["claude", "--remote-control", "--agent", "planner", "--permission-mode", "acceptEdits"]
 
 [leaves.signoff]
@@ -735,6 +794,14 @@ id = "adversary"
 role = "refute the red→green evidence and the reviewer's verdict; find the input that breaks the fix"
 mode = "command"
 family = "claude"
+agent = "adversary"
+# Strongest model (from autobook-pdca#1): refuting is harder than reviewing — it must
+# construct the input that breaks a fix two other models already signed off on — and it is
+# the last line before auto_iterate rebuilds unattended. #1 rationed it to high-difficulty
+# bundles to keep opus affordable; it now runs on every bundle (see above), so this is the
+# first knob to turn if Check cost bites.
+model = "opus"
+effort = "high"
 argv = ["claude", "-p", "--agent", "adversary", "--permission-mode", "acceptEdits", "--allowedTools", "Read,Bash,Grep,Glob"]
 
 # The SECURITY lens (ported from eduralph/nl-shell-pdca, after getwyrd/wyrd-pdca#274): reads
@@ -928,47 +995,135 @@ argv = ["claude", "-p", "--agent", "plan-reviewer", "--permission-mode", "accept
 # per_lane = true
 # level = "WARN"
 
-# --- autobook-pdca's rows -------------------------------------------------------------
+[doctor]
+# The harness's own footprint here is small — a handful of nox virtualenvs per lane
+# worktree, not a multi-GB build tree — so the default threshold is ample headroom
+# rather than a tight fit. Kept explicit because [driver].lanes x .nox scales it.
+min_free_gb = 10.0
+
+# ---------------------------------------------------------------------------
+# Autobook's gate toolchain.
+#
+# The whole delegated gate is `./engine/nox.sh gate` → `cd <autobook checkout> &&
+# nox -s gate`. Everything below is a prerequisite of THAT command. Autobook's
+# noxfile.py stays the single source of gate truth; these rows only assert that the
+# machine can run it — they re-declare no gate.
+#
+# Note what is deliberately NOT here: ruff, mypy, pytest. `nox` builds a fresh
+# virtualenv per session and pip-installs pinned versions itself, so they are never
+# a machine dependency. The network they need IS one — see the PyPI row.
+#
+# EVERY `id` BELOW IS A BARE TOKEN, and must stay one. `doctor.registered_ids` is
+# exact set membership: a brief's `External dependencies` field names a dependency as
+# a backticked token equal to a row's id (`typos` ↔ id = "typos"), and an unmatched
+# token becomes a §6 item that BLOCKS accept (#263). A descriptive id like
+# "typos (spell gate)" registers nothing a brief can name, so it would manufacture a
+# false blocker on a correctly-written brief. Put the description in `hint` — which
+# is what prints when the row fails — never in `id`.
+# ---------------------------------------------------------------------------
+
 [[doctor.checks]]
-group = "target"
-id = "sibling checkout ../autobook"
-cmd = "test -e ../autobook/.git"
-hint = "git clone https://github.com/Ralphovi/autobook.git ../autobook"
+group = "autobook gate toolchain"
+id = "nox"
+cmd = "command -v nox >/dev/null 2>&1 || test -x .venv/bin/nox"
+hint = "make install — [install].extra_bootstrap installs nox into .venv, and engine/nox.sh falls back to it (or pipx install nox)"
 required = true
 
 [[doctor.checks]]
-group = "target"
-id = "threat model (security-review leaf)"
-cmd = "test -f ../autobook/.oss-scanner/threat_model.md"
-hint = "the security-review advisory leaf rates every patch against it; it lands with Ralphovi/autobook#18"
+group = "autobook gate toolchain"
+id = "autobook-checkout"
+cmd = 'test -f "${AUTOBOOK_REPO:-../autobook}/noxfile.py"'
+hint = "clone Ralphovi/autobook as a sibling ../autobook, or set $AUTOBOOK_REPO — engine/nox.sh resolves $PDCA_WORKTREE, then $AUTOBOOK_REPO, then ../autobook"
+required = true
+
+# THE FALSE-GREEN ROW. `nox -s typos` uses venv_backend="none" and, when `typos` is
+# absent, warns and RETURNS — the session passes, so `nox -s gate` exits 0 having
+# spell-checked nothing. CI installs typos unconditionally (ci.yml pins v1.48.0) and
+# always runs it. So a missing binary does not fail a bundle here; it makes C4-ci go
+# GREEN on a patch CI will then reject, which is exactly the "never report a skipped
+# step as having run" rule in Autobook's AGENTS.md. Required for that reason: the
+# damage is a silent pass, not a loud failure.
+[[doctor.checks]]
+group = "autobook gate toolchain"
+id = "typos"
+cmd = "command -v typos"
+hint = "cargo install typos-cli --locked (or a distro package) — without it `nox -s gate` still exits 0 with the spell gate un-run, while CI runs it and fails the PR"
+required = true
+
+# The gate refuses to run outside noxfile.py's PYTHONS range (session.error), and it
+# runs on whatever interpreter NOX itself is installed under — not necessarily the
+# `python3` on PATH. Resolve nox's interpreter from its shebang and check that one,
+# falling back to python3 when the shebang is unreadable.
+[[doctor.checks]]
+group = "autobook gate toolchain"
+id = "nox-interpreter"
+cmd = '''py=$(sed -n '1s|^#!||p' "$(command -v nox || echo .venv/bin/nox)" 2>/dev/null); "${py:-python3}" -c 'import sys; raise SystemExit(0 if (3,11) <= sys.version_info[:2] <= (3,14) else 1)' '''
+hint = "reinstall nox on a supported interpreter — `nox -s gate` calls session.error() outside noxfile.py's PYTHONS range, so every bundle in the wave fails identically"
+level = "WARN"
+
+# Needed on EVERY gate read, not just a cold start. `worktree.rebuild_for_gate` reconstructs
+# the lane as base + patch.diff with `git clean -ffdxq` — the `-x` removes IGNORED files, so
+# `.nox` is destroyed before each gate and all four session venvs are rebuilt (measured:
+# ~8s cold vs ~3s warm, since pip's wheel cache lives in $HOME and survives the clean).
+# The rebuild still resolves against the index for the unpinned `pytest>=8` / `pytest-cov>=5`,
+# so an offline host fails EVERY gate inside pip, attributed to the bundle rather than the
+# machine. The lane is a warm CHECKOUT cache, never a warm BUILD cache.
+[[doctor.checks]]
+group = "autobook gate toolchain"
+id = "pypi"
+cmd = "python3 -c \"import urllib.request as u; u.urlopen('https://pypi.org/simple/', timeout=5)\""
+hint = "every gate read rebuilds .nox from scratch (the lane clean is `-x`); offline, every gate fails inside pip and looks like a bad patch"
+level = "WARN"
+
+# ---------------------------------------------------------------------------
+# Autobook's applier — NOT a gate, and deliberately unreachable as one.
+#
+# `nox -s applier` is the only session granted --system-site-packages, because
+# python3-gnucash lives in dist-packages and cannot be pip-installed. engine/nox.sh
+# refuses to expose it: it writes to a book, and by Autobook's rules runs against a
+# restored copy, attended, never by a driver. This row is a heads-up for the human's
+# own local runs (build order step 5), never a precondition of a PDCA cycle — hence
+# WARN and not required. It probes the SYSTEM python3, which is what that session sees.
+# ---------------------------------------------------------------------------
+
+[[doctor.checks]]
+group = "autobook applier (never a PDCA gate)"
+id = "python3-gnucash"
+cmd = "python3 -c 'import gnucash'"
+hint = "sudo apt install python3-gnucash — needed only for a local `nox -s applier`; no PDCA gate can reach it (see engine/nox.sh)"
+level = "WARN"
+
+# ---------------------------------------------------------------------------
+# The rest of the PDCA setup (autobook-pdca#3, after nl-shell-pdca). Same rule as above:
+# every id is a bare token a brief can name.
+# ---------------------------------------------------------------------------
+
+[[doctor.checks]]
+group = "autobook pdca"
+id = "pytest"
+cmd = ".venv/bin/python3 -c 'import pytest'"
+hint = "make install — [install].extra_bootstrap installs pytest and Autobook's deps into .venv; C4-verify runs the bundle's tests with it"
+required = true
+
+[[doctor.checks]]
+group = "autobook pdca"
+id = "pdca-cli"
+cmd = "./scripts/pdca --help"
+hint = "make install — or point $PDCA_CLI at the CLI; ./scripts/pdca resolves venv -> src -> PATH (the T4 row runs through it)"
+required = true
+
+[[doctor.checks]]
+group = "autobook pdca"
+id = "threat-model"
+cmd = 'test -f "${AUTOBOOK_REPO:-../autobook}/.oss-scanner/threat_model.md"'
+hint = "the security-review advisory leaf rates every patch against it (Ralphovi/autobook#18); pull ../autobook"
 level = "WARN"
 
 [[doctor.checks]]
-group = "engine"
-id = "nox runnable (C4-ci)"
-cmd = "command -v nox >/dev/null 2>&1 || test -x .venv/bin/nox"
-hint = "make install — [install].extra_bootstrap installs nox into .venv"
-required = true
-
-[[doctor.checks]]
-group = "engine"
-id = "pytest importable (.venv, C4-verify)"
-cmd = ".venv/bin/python3 -c 'import pytest'"
-hint = "make install — [install].extra_bootstrap installs pytest and Autobook's deps into .venv"
-required = true
-
-[[doctor.checks]]
-group = "engine"
-id = "pdca CLI resolvable (T4 row)"
-cmd = "./scripts/pdca --help"
-hint = "make install — or point $PDCA_CLI at the CLI; ./scripts/pdca resolves venv -> src -> PATH"
-required = true
-
-[[doctor.checks]]
-group = "engine"
-id = "bash >= 4 (gate scripts use mapfile)"
+group = "autobook pdca"
+id = "bash4"
 cmd = "bash -c 'test \"${BASH_VERSINFO[0]}\" -ge 4'"
-hint = "install a modern bash"
+hint = "install a modern bash — the engine scripts use mapfile"
 level = "WARN"
 
 # Deterministic Check gates (docs 04). Each check runs a shell command; it PASSES
