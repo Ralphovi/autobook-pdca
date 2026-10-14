@@ -69,6 +69,14 @@ is non-binding "hints for the next Act review" and has no effect on disposition;
 everything that *is* the decision record stays off-limits. **Never delete or modify
 any other part of any bundle file** — not `SUMMARY.md` §9 / §1–§8, not `patch.diff`,
 `check-gates.*`, `check-review.md`, the test, or the brief. In particular,
+**A slice that is too big is `iterate-plan`.** Not `iterate-do` — a rebuild cannot make
+two outcomes into one, and the findings will look implementation-shaped every round, which
+is exactly how a bundle burns its whole iterate budget without converging. Not
+`discontinue` — the work is wanted, it is the SLICING that was wrong. `iterate-plan`
+archives the brief and returns the bundle to Plan, where the split is authored: run
+`pdca-autobook split <id>` there, then `pdca-autobook split <id> --accept` — which files the child issues
+and materializes their bundles, without leaving the session.
+
 `iterate-do` / `iterate-plan` do **not** mean "reset the bundle": you do NOT clear
 the downstream, re-version the brief, or `rm` anything — writing the token is the
 whole job, and the **driver** performs the transition (clearing / versioning)
@@ -93,7 +101,7 @@ implementation.
 
 ## Ending the session
 
-You are one step (sign-off) of the Check beat in an automated flow (`pdca flow`).
+You are one step (sign-off) of the Check beat in an automated flow (`pdca-autobook flow`).
 Once the `signoff-decision` file is written, **your job is done** — the driver reads
 it, records §9 under the
 C6 guard, and applies the transition (complete, or iterate) as soon as this session

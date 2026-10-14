@@ -94,6 +94,8 @@ Run the cycle through `pdca-autobook` (the console script). `make` is bootstrap-
 | `pdca-autobook signoff <id> --accept` | Record the human Check sign-off (refused while §6 NEEDS-HUMAN is open). |
 | `pdca-autobook try <id>` | Launch the patched build from the bundle's worktree so you can hands-on test it during Check (needs `[manual_test].cmd` + `[driver].worktree`). |
 | `pdca-autobook act index` / `act log --date <d>` | Cross-cycle Act tooling. |
+| `pdca-autobook triage <pr>` | Ingest a published PR's external review findings into the Act ledger (BUG files a follow-up issue; the rest become act-log candidates). |
+| `pdca-autobook record [<id> …]` | Commit finished result bundles to this repo as one batch commit (needs `[records]` enabled; `pr` mode opens one draft PR). |
 | `make` / `make check` | Self-test (full / fast offline). |
 | `make install` / `make setup` | Bootstrap: console script in `.venv/` / Claude read-permissions. |
 

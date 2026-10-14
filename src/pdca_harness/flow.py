@@ -21,13 +21,15 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import re
 import sys
 import threading
+from collections.abc import Collection, Mapping
 from pathlib import Path
 
-from . import (act, assemble, autoiterate, brief, driver, gates, integrate, lane, leaves,
-               merge, merged, preflight, publish, queue, signoff, sources, state, sweep,
-               waves)
+from . import (act, assemble, autoiterate, brief, drive_claim, driver, gates, integrate, lane,
+               leaves, merge, merged, preflight, publish, queue, signoff, size_signal, sources,
+               split, state, sweep, waves)
 from .config import Config
 
 
@@ -83,6 +85,52 @@ def _chunks(items: list, n: int):
 # Shared: the deterministic record/transition for one already-decided bundle, and
 # the single-issue "run the sign-off leaf then apply" convenience.
 # ----------------------------------------------------------------------------
+#: :func:`_apply_decision` outcome meaning "nothing was recorded, but the bundle was returned
+#: to a state a later beat can act on". Distinct from ``None`` (nothing to do — stop) and from
+#: ``"blocked"`` (C6 refused an accept — stop) precisely because the caller must NOT stop: the
+#: bundle is mid-repair, and breaking would strand it one beat short of a fresh SUMMARY.
+REASSEMBLE = "reassemble"
+
+
+def _quarantine_summary(d: Path, today: str) -> Path | None:
+    """Move a malformed ``SUMMARY.md`` aside so the bundle can reassemble; ``None`` on failure.
+
+    Renamed rather than deleted: it may carry §6 boxes the human ticked, and it is the
+    evidence about whichever leaf produced it. Date-stamped like ``revalidation-<date>.json``,
+    with a counter so a second incident on the same day cannot overwrite the first.
+    """
+    for n in range(1, 100):
+        suffix = "" if n == 1 else f"-{n}"
+        dest = d / f"SUMMARY.malformed-{today}{suffix}.md"
+        if dest.exists():
+            continue
+        try:
+            (d / "SUMMARY.md").rename(dest)
+        except OSError:
+            return None
+        return dest
+    return None
+
+
+def _repair_unsignable(d: Path, *, action: str, today: str, why: str) -> str | None:
+    """Move an unsignable ``SUMMARY.md`` aside and drop the stale decision; the caller's
+    return value.
+
+    Leaving the file in place would NOT re-drive: with SUMMARY.md present the bundle sits at
+    AWAITING_SIGNOFF, a HALTED state, so no beat reassembles it — the single-issue flow stops
+    and the batch sweep re-presents the same unusable summary every pass until the budget
+    runs out. Moving it aside drops the bundle to CHECKED, which the next beat rebuilds from
+    the check artifacts.
+    """
+    (d / leaves.SIGNOFF_DECISION).unlink(missing_ok=True)
+    kept = _quarantine_summary(d, today)
+    where = f"kept as {kept.name}" if kept else "could not be moved aside"
+    print(f"flow: {d.name} — decision '{action}' not recorded ({why}); unsignable "
+          f"SUMMARY.md {where}; bundle returned to {state.state(d)} to reassemble",
+          file=sys.stderr)
+    return REASSEMBLE if kept else None
+
+
 def _apply_decision(
     cfg: Config, d: Path, *, by: str, today: str, apply_now: bool
 ) -> str | None:
@@ -90,8 +138,9 @@ def _apply_decision(
 
     Reads the ``signoff-decision`` token a sign-off session (single or batch) left,
     records §9, and (if ``apply_now``) advances the transition. Returns the action
-    applied, ``None`` if no decision / unrecordable, or ``"blocked"`` if an accept was
-    refused because §6 NEEDS-HUMAN is still open. Pure deterministic code — no leaf.
+    applied, ``None`` if no decision / unrecordable, :data:`REASSEMBLE` if a malformed
+    SUMMARY was moved aside so a later beat can rebuild it, or ``"blocked"`` if an accept
+    was refused because §6 NEEDS-HUMAN is still open. Pure deterministic code — no leaf.
 
     ``apply_now`` advances the bundle immediately (single-issue ``flow``). The batch
     sweep passes ``apply_now=False`` so an ``iterate-do`` does NOT rebuild on the spot —
@@ -115,15 +164,44 @@ def _apply_decision(
               f"{state.state(d)}); skipping record, will re-drive", file=sys.stderr)
         (d / leaves.SIGNOFF_DECISION).unlink(missing_ok=True)
         return None
-    if action == "accept" and signoff.open_needs_human(d / "SUMMARY.md"):
+    # BEFORE the C6 guard, deliberately. `open_needs_human` is the lenient side of
+    # `_section`, so on a summary with no §6 heading it scans the whole document and can
+    # return "blocked" for an accept — which would stop here and never reach the repair
+    # below, stranding the bundle exactly as an unrepaired malformed summary does (#330
+    # review). Whether the artifact can be written to at all is a property of the artifact,
+    # not of the decision, so it is settled first. C6 is not weakened: reassembly rebuilds §6
+    # from the review artifacts with every box unticked, so the guard fires on the next pass.
+    problem = signoff.unrecordable(d / "SUMMARY.md")
+    if problem:
+        return _repair_unsignable(d, action=action, today=today, why=problem)
+    if action == "accept" and accept_blockers(d):
         print(f"flow: {d.name} — cannot accept, §6 NEEDS-HUMAN still open (C6)", file=sys.stderr)
         return "blocked"
     # The iterate rationale ("why rejected / what to change") rides §9 → the driver
     # folds it into the brief's carry-forward so the next iteration isn't blind.
     # §9's "Iteration delta" is a single line, so flatten a multi-line rationale.
     rationale = " ".join(leaves.signoff_rationale(d).split())
-    signoff.record(d / "SUMMARY.md", action=action, by=by or cfg.author or "unknown",
-                   date=today, delta=rationale)
+    try:
+        signoff.record(d / "SUMMARY.md", action=action, by=by or cfg.author or "unknown",
+                       date=today, delta=rationale)
+    except ValueError as exc:
+        # The `unrecordable` pre-check above catches the ordinary shapes; this stays as the
+        # backstop for the ones only the write can detect (a duplicated §9 body, where the
+        # substitution lands on the wrong copy). Contained HERE rather than left to
+        # `_isolate` because the single-issue flow has no `_isolate` around this call, and a
+        # traceback would abandon the run instead of reporting one bad bundle.
+        return _repair_unsignable(d, action=action, today=today, why=str(exc))
+    # Driver-side capture of the session's carry-forward (issue #331). The rationale
+    # lines below the token are the LIVE channel — the sign-off session writes them as
+    # each decision is made — and the unlink below destroys the only full copy while §9
+    # keeps a single flattened line. Captured for the iterate paths, where
+    # driver._carry_forward_into_brief consumes and merges it (the registering and the
+    # consuming of this channel ship together); the file is OUTSIDE the reviewer's
+    # inputs and is archived with its attempt (state.DOWNSTREAM_OF_BRIEF).
+    if action in ("iterate-do", "iterate-plan"):
+        full = leaves.signoff_rationale(d)
+        if full:
+            (d / state.SESSION_CARRY).write_text(full + "\n", encoding="utf-8")
     (d / leaves.SIGNOFF_DECISION).unlink(missing_ok=True)
     # Apply now for single-issue flow; in the batch sweep apply an ``iterate-plan`` re-open
     # too — it only archives → UNPLANNED (no rebuild), so it can't interrupt the cheap-first
@@ -134,10 +212,90 @@ def _apply_decision(
     return action
 
 
+def accept_blockers(d: Path) -> list[str]:
+    """The open §6 rows that refuse an accept (C6) — read the same way on every accept path.
+
+    There are two, and both take their C6 check from here: :func:`_apply_decision` (every
+    ``flow`` sign-off — single, batch, a decision already recorded in the bundle) and
+    ``cli._signoff`` (``pdca signoff <id> --accept``). While the CLI ran a check of its own,
+    the ledger rule below held on one path and not the other.
+
+    Before reading §6 it puts an unreadable deferred-findings ledger (#409) into §6 as an open
+    row. Assembly already renders that row when the ledger is unreadable at assembly time;
+    this covers a ledger that became unreadable AFTER the SUMMARY was assembled, whose
+    findings the SUMMARY on disk may not carry — whether or not auto-iterate is on, since a
+    ledger written by an earlier run outlives the setting that wrote it. A row the human has
+    already ticked is their clearance and is left alone, as C6 honours every other tick.
+
+    The row is written to, and C6 read from, the same §6: the one ``assemble`` wrote, never a
+    ``## 6. NEEDS-HUMAN`` block a leaf quoted into §5 (``signoff._needs_human_section``).
+    Read from the quote, a block of ticked rows passed an accept over open rows below it.
+    """
+    problem = autoiterate.ledger_problem(d)
+    if problem and signoff.ensure_needs_human_item(d / "SUMMARY.md",
+                                                  autoiterate.UNREADABLE_LEDGER_ITEM):
+        print(f"{d.name} — {problem}; added it to §6 NEEDS-HUMAN", file=sys.stderr)
+    return signoff.open_needs_human(d / "SUMMARY.md")
+
+
+#: :func:`_apply_recorded_decision` outcome meaning "the bundle carries no decision, so it
+#: still owes a sign-off session". Deliberately distinct from every other outcome, because
+#: only this one may open a session: ``None`` means a decision WAS on disk but could not be
+#: recorded (the bundle was repaired / dropped to a state a later beat re-drives — asking
+#: again would ask about an artifact that no longer exists), :data:`REASSEMBLE` likewise,
+#: and ``"blocked"`` is the one case that DOES fall through (C6 refused an accept).
+UNDECIDED = "undecided"
+
+
+def _apply_recorded_decision(
+    cfg: Config, d: Path, *, by: str, today: str, apply_now: bool
+) -> str | None:
+    """Consume the decision the bundle **already carries**, before any session is offered.
+
+    Read-before-asking (issue #453). ``signoff-decision`` is a bundle file, so it is
+    durable, un-consumed *input* to the driver — not an in-process by-product of the
+    session that wrote it. A run that dies between the leaf's write and the apply (a ``^C``:
+    :func:`_isolate` deliberately does not contain ``KeyboardInterrupt``) leaves that
+    decision orphaned on disk with §9 unrecorded and the bundle still AWAITING_SIGNOFF.
+    Every later pass and every later run then re-presents it, opens a **fresh session for a
+    bundle the human already judged**, and that session's write destroys their decision.
+    The state of an issue *is* the files in its bundle (:mod:`state` module docstring) —
+    a file read only through the variable of the call that produced it is not state.
+
+    Returns :data:`UNDECIDED` when there is nothing recorded (the caller must ask); anything
+    else is :func:`_apply_decision`'s own outcome, so the callers keep the single
+    C6-guarded record/transition path and handle ``REASSEMBLE`` / ``"blocked"`` / ``None``
+    exactly as they already do after a session. Never silent: an apply with no session
+    names the bundle and the action on stderr — printed AFTER the apply, and only when the
+    decision was genuinely recorded. ``_apply_decision`` returns the action itself in that
+    one case and a sentinel in every other, and ``leaves.VALID_DECISIONS`` holds none of the
+    sentinels, so ``outcome == action`` IS "it was applied" and cannot collide with a token
+    named after one. Announced up front instead, the notice claimed an outcome nothing had
+    decided yet, and each of the other outcomes is a later step withdrawing it one line
+    later: the C6 accept-guard refuses and a fresh session follows (:func:`_apply_decision`),
+    or the record is dropped / the summary repaired and the bundle goes back to reassemble
+    (:func:`_repair_unsignable`). Those paths stay reported — each already prints its own
+    line naming this bundle and this action — but they must not be reported as an apply.
+    """
+    action = leaves.signoff_decision(d)
+    if not action:
+        return UNDECIDED
+    outcome = _apply_decision(cfg, d, by=by, today=today, apply_now=apply_now)
+    if outcome == action:
+        print(f"flow: {d.name} — applied the '{action}' sign-off decision already recorded "
+              f"in the bundle; no new session", file=sys.stderr)
+    return outcome
+
+
 def _signoff_and_apply(
     cfg: Config, d: Path, *, by: str, today: str, apply_now: bool = True
 ) -> str | None:
-    """Single-issue: run the interactive sign-off leaf, then apply its decision."""
+    """Single-issue: apply the decision the bundle already carries (issue #453); only when
+    there is none — or when C6 refuses it, so the human genuinely must come back — run the
+    interactive sign-off leaf and apply the decision it writes."""
+    applied = _apply_recorded_decision(cfg, d, by=by, today=today, apply_now=apply_now)
+    if applied not in (UNDECIDED, "blocked"):
+        return applied
     leaves.run_signoff(d, cfg)
     return _apply_decision(cfg, d, by=by, today=today, apply_now=apply_now)
 
@@ -145,12 +303,16 @@ def _signoff_and_apply(
 def _maybe_auto_iterate(
     cfg: Config, d: Path, *, by: str, today: str, apply_now: bool
 ) -> bool:
-    """Rebuild without asking, when Check found only implementation defects (issue #264).
+    """Rebuild without asking while Check still finds implementation work (#264, #409).
 
-    Returns True iff the bundle was routed to ITERATE_DO. Every other outcome — auto-iterate
-    off, the bundle not halted at AWAITING_SIGNOFF, an empty §6, any HUMAN-kind finding, or
-    the per-bundle budget spent — returns False and leaves the bundle exactly where it was,
-    for the human.
+    Returns True iff the bundle was routed to ITERATE_DO. HUMAN findings beside the IMPL ones
+    do not stop it: ``autoiterate.write_decision`` defers them to the ledger, and assembly
+    returns them to §6 at handover — all but a review or gate that gave no verdict, which the
+    next Check runs again (``autoiterate.defer``). Every other outcome — auto-iterate off,
+    the bundle not halted at AWAITING_SIGNOFF, a decision already recorded in the bundle and
+    not yet consumed, a §6 with no IMPL item (empty, or HUMAN only), the size backstop's
+    item, the per-bundle budget spent, or a deferred ledger it cannot read — returns False
+    and leaves the bundle exactly where it was, for the human.
 
     Deliberately routed through the existing ``_apply_decision`` rather than calling
     ``signoff.record`` directly: §9 then stays authored solely by ``signoff.record``, and the
@@ -164,6 +326,16 @@ def _maybe_auto_iterate(
     """
     if not cfg.auto_iterate or state.state(d) != state.AWAITING_SIGNOFF:
         return False
+    # Never author a decision over one this driver did not write (issue #453).
+    # ``autoiterate.write_decision`` below is unconditional, so a `signoff-decision` still on
+    # disk — an earlier session's call, orphaned when that run died before the driver applied
+    # it — would be silently replaced by an `iterate-do` the human never gave. Declining also
+    # spends no budget on a bundle that is already decided: the sign-off paths apply it.
+    recorded = leaves.signoff_decision(d)
+    if recorded:
+        print(f"flow: {d.name} — not auto-iterating: a '{recorded}' sign-off decision is "
+              f"already recorded in the bundle, waiting to be applied", file=sys.stderr)
+        return False
     try:
         items = assemble.collect_needs_human(d, cfg)
     except (OSError, ValueError) as exc:
@@ -175,16 +347,42 @@ def _maybe_auto_iterate(
               f"not auto-iterating", file=sys.stderr)
         return False
     if not autoiterate.eligible(items):
+        # The loop has exactly two stops while implementation work remains (#409): the size
+        # backstop here and the hard cap below. Say WHY when it was the size backstop
+        # (#324). It fires at 2 rounds while `max_auto_iters` defaults to 3, so it
+        # deliberately stops the loop with a round still nominally available — and an
+        # operator who set that number and sees the loop halt early has to be able to read
+        # the reason, or their setting simply appears not to work. Every other decline is a
+        # §6 with no implementation work at all, which the human is about to read anyway.
+        for item in items:
+            if size_signal.is_size_item(item.text):
+                print(f"flow: {d.name} — not auto-iterating: {item.text}",
+                      file=sys.stderr)
+                break
         return False
     spent = autoiterate.count(d)
     if spent >= cfg.max_auto_iters:
         print(f"flow: {d.name} — auto-iterate budget spent ({spent}/{cfg.max_auto_iters}); "
               f"handing the implementation findings to the human", file=sys.stderr)
         return False
-    autoiterate.write_decision(d, items)
-    print(f"flow: {d.name} — auto-iterate {spent + 1}/{cfg.max_auto_iters}: "
-          f"{len(items)} implementation-level finding(s), no human judgment needed",
-          file=sys.stderr)
+    try:
+        autoiterate.write_decision(d, items)
+    except autoiterate.DeferredLedgerUnreadable as exc:
+        # Raised before any budget is spent or decision written. Rebuilding now would
+        # archive this SUMMARY while the ledger could not record its HUMAN findings, so hand
+        # over instead. The unreadable-ledger row blocks accept: assembly renders it, and
+        # `accept_blockers` adds it if the ledger broke after assembly.
+        print(f"flow: {d.name} — not auto-iterating: {exc}", file=sys.stderr)
+        return False
+    impl = sum(1 for item in items if item.kind == assemble.IMPL)
+    held = len(autoiterate.deferrable(items))
+    rerun = sum(1 for item in items if item.no_verdict)
+    deferred = (f"; {held} finding(s) needing human judgment deferred to handover "
+                f"({autoiterate.DEFERRED_FILE})" if held else "")
+    rechecked = (f"; {rerun} review/gate row(s) with no verdict left for the next Check to "
+                 "re-run" if rerun else "")
+    print(f"flow: {d.name} — auto-iterate {spent + 1}/{cfg.max_auto_iters}: rebuilding for "
+          f"{impl} implementation-level finding(s){deferred}{rechecked}", file=sys.stderr)
     return _apply_decision(cfg, d, by="auto-iterate", today=today,
                            apply_now=apply_now) == "iterate-do"
 
@@ -237,6 +435,22 @@ def flow(
 ) -> str:
     """Drive one issue through the whole cycle; return its final state.
 
+    **Not a CLI route** (issue #468). ``pdca flow <id>`` and ``pdca flow <id> <id>`` both go
+    through :func:`flow_ids` and the one results map it returns; this is the single-bundle
+    library driver (used by the offline slices, which inject a per-bundle
+    ``leaves.run_signoff`` the wave path does not call). Anything that must report or exit
+    on a bundle's disposition belongs on ``flow_ids`` — a state STRING cannot carry the
+    per-id map both CLI shapes derive their report and exit code from, and giving one shape
+    its own drive path is exactly the asymmetry #468 removed. ``cli._flow`` calling this
+    again is a regression a test pins (``test_flow_entrypoint_parity``).
+
+    For the same reason this does **not** adopt the children of a split (#469): adoption
+    lives once on the shared wave path (:func:`_drive_and_act`), which every CLI shape and
+    ``flow_batch`` reach, and a second copy here — driving a bundle that is not in a
+    ``wave_list`` and keeps no run-scoped budget — is precisely the divergence #468 removed
+    and #449 spent five iterations chasing. A caller that wants a split driven wants
+    ``flow_ids([id])``.
+
     ``max_iters`` defaults to ``cfg.max_passes`` (``[driver].max_passes``). Exhausting it
     with the bundle still iterating is NOT silent (issue #260) — the ``for``/``else`` names
     it with a resume hint. The ``break`` paths are the ordinary halts (COMPLETE, a human
@@ -254,7 +468,14 @@ def flow(
         # (#264). The `for` bounds this, and so does the per-bundle auto budget.
         if _maybe_auto_iterate(cfg, d, by=by, today=today, apply_now=True):
             continue
-        if _signoff_and_apply(cfg, d, by=by, today=today) in (None, "blocked"):
+        applied = _signoff_and_apply(cfg, d, by=by, today=today)
+        if applied == REASSEMBLE:
+            # A malformed SUMMARY was moved aside; the bundle is back at CHECKED. Loop so
+            # this pass's `run_issue` rebuilds §1–8 and offers sign-off again, rather than
+            # stopping one beat short of a usable summary. Bounded by `max_iters` like every
+            # other retry here, and reassembly is deterministic code, so it cannot spin.
+            continue
+        if applied in (None, "blocked"):
             break
         if state.state(d) == state.COMPLETE:
             break
@@ -419,11 +640,20 @@ def _sweep_quietly(cfg: Config, bundles: list[Path]) -> None:
 
 
 def _publish_bundle(cfg: Config, d: Path, *, by: str, today: str,
-                    texts_prevalidated: bool = False) -> None:
+                    texts_prevalidated: bool = False) -> bool:
     """Publish one COMPLETE bundle (Check's closing step), isolated so a single failure
     can't abort the batch (testbed #3); a non-zero return is loud, never silent (#97).
     ``texts_prevalidated`` (#295 review): the wave pre-pass already drafted + T4-gated
-    the texts, so publish runs mechanics-only (no second T4 run mid-wave)."""
+    the texts, so publish runs mechanics-only (no second T4 run mid-wave).
+
+    Returns whether this call pushed the bundle's branch, so the wave fold has it to merge
+    (#593). Read off ``publish.json``: both publish paths write it only once every step,
+    the push included, has succeeded — also when ``gh pr create`` then fails (rc 1, e.g. an
+    iterated bundle whose old draft PR is still open), and that pushed branch is folded. So
+    True iff, after the call, the record exists and either did not exist before it or its
+    ``st_mtime_ns`` changed. An earlier run's record, which an iterate keeps, never counts,
+    nor does a call that raised (``_isolate`` logged it): that errs toward holding."""
+    before = _record_mtime(d)
     rc = _isolate(d, "publish", lambda: publish.publish(
         cfg, d.name.removeprefix("issue_"),
         dry_run=cfg.publisher.mode == "stub", by=by, today=today, skip_if_no_target=True,
@@ -431,60 +661,299 @@ def _publish_bundle(cfg: Config, d: Path, *, by: str, today: str,
     if rc not in (0, None):  # None ⇒ _isolate already logged an exception
         print(f"flow: {d.name} is COMPLETE but publish did not complete (rc {rc}) — NOT "
               f"published; run `pdca publish {d.name.removeprefix('issue_')}`.", file=sys.stderr)
+    after = _record_mtime(d)
+    return rc is not None and after is not None and after != before
+
+
+def _record_mtime(d: Path) -> int | None:
+    """``publish.json``'s ``st_mtime_ns``, or None when there is none — to tell a record the
+    publish call just wrote from one an earlier run left (#593)."""
+    try:
+        return (d / "publish.json").stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 # ----------------------------------------------------------------------------
 # Shared multi-bundle driver: compute waves → per wave (drive → cheap-first sign-off →
 # publish → fold onto the integration branch the next wave builds on) → Act once (docs 09).
 # ----------------------------------------------------------------------------
-def _runnable(cfg: Config, wave: list[Path], batch_names: set[str]) -> list[Path]:
+def _runnable(cfg: Config, wave: list[Path], batch_names: set[str], *,
+              held: set[str] | frozenset[str] = frozenset(),
+              requested: Collection[str] | None = None,
+              hold_unmerged: bool = False) -> list[Path]:
     """Drop a wave bundle whose declared prerequisite isn't ready to build on top of.
 
-    A prerequisite **in this run's batch** is carried into the dependent's base by the wave
-    fold once it reaches COMPLETE (it sits in an earlier wave), so COMPLETE is the bar — e.g.
-    a prereq DISCONTINUED earlier never gets there, and its dependent is skipped loudly. A
-    prerequisite **outside this batch** (a prior run's) is gated on its on-disk COMPLETE state
-    (archived `completed/` too, #171) — **except** an out-of-batch ``Depends on (merged)``
-    prereq, which keeps its stricter #107 merge-gate (#186): nothing in *this* run carries an
-    out-of-batch prereq's diff into the base, and COMPLETE means only "a draft PR was opened",
-    so a dependent built on a COMPLETE-but-unmerged base would miss the prerequisite. It must
-    wait until the PR is genuinely merged (``merged.is_merged``) — a later ``pdca flow`` run
-    then picks it up. A skipped bundle never completes, so its own dependents fall out of later
-    waves the same way (the skip cascades)."""
+    A prerequisite that is not COMPLETE on disk (archived ``completed/`` too, #171) is never
+    ready, whichever field names it — e.g. a prereq DISCONTINUED earlier never gets there,
+    and its dependent is skipped loudly. A prerequisite **in this run's batch** is carried
+    into the dependent's base by the wave fold once it reaches COMPLETE (it sits in an
+    earlier wave), so COMPLETE is the bar. An in-batch prerequisite named in ``held``
+    (bundle dir names, #593) is not ready either: it is COMPLETE, but this run pushed no
+    branch of it (its texts or its publish failed before the push), so the fold has nothing
+    of it to carry — its dependents are held while the rest of the run goes on. A
+    prerequisite **outside this batch** (a prior run's) is gated on its COMPLETE state —
+    **except** an out-of-batch ``Depends on (merged)`` prereq, which keeps its stricter #107
+    merge-gate (#186): nothing in *this* run carries an out-of-batch prereq's diff into the
+    base (a finished named id aside, below), and COMPLETE means only "a draft PR was
+    opened", so a dependent built on a COMPLETE-but-unmerged base would miss the
+    prerequisite. It must wait until the PR is genuinely merged into the DEPENDENT's target
+    base — its repo and branch (``publish._resolve_target``), not just some branch
+    (``merged.merged_into``, #647) — a later ``pdca flow`` run then picks it up. With
+    ``hold_unmerged`` (stack mode, publishing on, not a dry-run, #647) a plain ``Depends
+    on`` prerequisite the run was NOT asked for — not in ``requested`` (bundle dir names;
+    ``None``: ``batch_names``) — waits the same way when a line would carry it (a non-empty
+    patch and a usable target, ``integrate._fold_candidates``): no line of this run does.
+    Either way the dependent is named on ONE stderr line, with what to do. A dependent with
+    no usable target of its own (publish skips it) has no base to wait for: no #647 hold,
+    and its ``Depends on (merged)`` keeps #186's answer — any merge counts. A finished named
+    id (an id the run was asked for that an earlier run finished, #646) is carried onto the
+    line before wave 0 when it is clean (:func:`_carry_finished`); when it is not, it is
+    named in ``held``, and a bundle whose plain ``Depends on`` names it is not ready (a
+    ``Stacks on`` edge to it is not held). A skipped bundle never completes, so its own
+    dependents fall out of later waves the same way (the skip cascades)."""
+    asked = set(requested) if requested is not None else set(batch_names)
     runnable: list[Path] = []
     for d in wave:
         bp = d / "brief.md"
-        merged_deps = set(brief.depends_on_merged(bp)) if bp.exists() else set()
+        deps = waves.declared_deps(bp) if bp.exists() else []
+        merged_deps = set(brief.depends_on_merged(bp)) if deps else set()
+        plain_deps = set(brief.depends_on(bp)) if deps else set()
+        # "Merged" means merged into d's OWN target (#647) — none usable: ("", "").
+        repo, base = publish._resolve_target(d)[:2] if deps else ("", "")
+        targeted = bool(repo and base)
         unmet: list[str] = []
-        for dep in (waves.declared_deps(bp) if bp.exists() else []):
-            out_of_batch = cfg.bundle(dep).name not in batch_names
-            if out_of_batch and dep in merged_deps:
-                if not merged.is_merged(cfg, dep):  # PR not yet merged — wait, don't build (#186)
+        unmerged: list[str] = []   # COMPLETE, but not merged into d's base: wait (#647)
+        carryable: list[str] = []  # … of those, ones a line of d's target would carry
+        for dep in deps:
+            p = cfg.find_bundle(dep)
+            out_of_batch = p.name not in batch_names
+            if state.state(p) != state.COMPLETE:  # archived prereq too (#171)
+                unmet.append(dep)  # not ready, whichever field names it
+                continue
+            # A plain `Depends on` prereq the run was not asked for, which a line would
+            # carry: no line of this run does (#647).
+            cand = (integrate._fold_candidates([p])
+                    if hold_unmerged and targeted and out_of_batch and dep in plain_deps
+                    and p.name not in asked else [])
+            if out_of_batch and (dep in merged_deps or cand):
+                # Only a merge INTO d's base puts it there (#186 for `Depends on (merged)`,
+                # #647 for the plain edge above). With no target of d's own, #186's answer
+                # and its "not ready" line stand.
+                if merged.merged_into(cfg, dep, repo, base):
+                    continue
+                if not targeted:
                     unmet.append(dep)
-            elif state.state(cfg.find_bundle(dep)) != state.COMPLETE:  # archived prereq too (#171)
+                    continue
+                unmerged.append(p.name)
+                if cand and dep not in merged_deps and cand[0][1:3] == (repo, base):
+                    carryable.append(p.name)  # named in the run, the carry puts it on (#646)
+            elif p.name in held and (not out_of_batch or dep in plain_deps):
+                # In batch: accepted, but no branch pushed this run: nothing to fold (#593).
+                # Out of batch: a finished named id the carry could not put on the line (#646).
                 unmet.append(dep)
+        if unmerged:
+            todo = (f"name {', '.join(carryable)} in the same `pdca flow <ids>` command so "
+                    f"the run's line carries them, or wait" if carryable else "wait")
+            print(f"flow: {d.name} held — prerequisite(s) {', '.join(unmerged)} not merged "
+                  f"into {base} ({repo}), and no line of this run carries them; not built "
+                  f"on a base missing them. To build it, {todo} until their PR merges into "
+                  f"{base}, then re-run.", file=sys.stderr)
         if unmet:
             print(f"flow: {d.name} skipped — prerequisite(s) not ready "
                   f"({', '.join(unmet)}); not built on a base missing them.", file=sys.stderr)
-        else:
+        if not unmet and not unmerged:
             runnable.append(d)
     return runnable
 
 
-def _point_at_integration(integ: dict[tuple[str, str], str], runnable: list[Path]) -> None:
+def _point_at_integration(integ: dict[tuple[str, str], str], runnable: list[Path],
+                          tips: Mapping[tuple[str, str], str | None] | None = None) -> None:
     """Reconcile each runnable bundle's stack base with THIS run's integration state (#187).
 
     ``integ`` maps each integrated target to its run-scoped integration branch. A bundle is
     pointed at the branch for **its own** ``(repo, base)`` target only — never a sibling
     target's, which is absent on that repo or carries unrelated patches. A bundle whose target
     wasn't integrated this run has any **stale** stack base (left by a prior/resumed run)
-    cleared, so it builds off its own target base rather than an old integration branch."""
+    cleared, so it builds off its own target base rather than an old integration branch.
+
+    ``tips`` maps a target to the line commit the run's last fold pushed (#593; ``None`` in
+    a dry-run): the commit the bundle is built on. It is recorded beside the branch
+    (``stack-base-tip``), so publish cuts the PR branch from it even after later waves have
+    grown the line (a held bundle published late)."""
     for d in runnable:
-        branch = integ.get(publish._resolve_target(d)[:2])
+        target = publish._resolve_target(d)[:2]
+        branch = integ.get(target)
         if branch:
-            publish.write_stack_base(d, branch)
+            publish.write_stack_base(d, branch, (tips or {}).get(target))
         else:
             publish.clear_stack_base(d)
+
+
+def _fold_lines(cfg: Config, bundles: list[Path], *, dry: bool,
+                folded_this_run: Mapping[tuple[str, str], str | None], batch: list[str],
+                skipped: dict[str, str] | None = None,
+                ) -> tuple[dict[tuple[str, str], tuple[str, Path | None]],
+                           dict[tuple[str, str], str | None], tuple[str, str] | None]:
+    """ONE :func:`integrate.fold` of ``bundles`` and, with ``[driver].regate_between_waves``,
+    the re-gate of each line it pushed, under ONE lock scope (#297 review round 10): the
+    locks stack keeps every target's integ lock held from the fold through the tip read and
+    the re-gate, so no gap exists in which another flow's publish-boundary sweep could
+    remove the tree — or another fold rewrite it — before the re-gate attests it. The in-run
+    fold and the pre-wave carry (#646) share it; only what they do with the result differs.
+
+    Returns ``(folded, tips, red)``: the fold's result, each folded target's pushed tip
+    (None in a dry-run, which pushes nothing), and the first target whose re-gate is red
+    (None: none is, or none ran). An :class:`integrate.IntegrationError` from the fold or
+    the tip read propagates."""
+    with contextlib.ExitStack() as locks:
+        folded = integrate.fold(cfg, bundles, dry_run=dry, locks=locks,
+                                folded_this_run=folded_this_run, batch=batch, skipped=skipped)
+        tips = {tgt: integrate.pushed_tip(wt) if wt is not None else None
+                for tgt, (_branch, wt) in folded.items()}
+        # hold_lock=False: the locks stack already holds each tree's lock (re-acquiring
+        # would deadlock on our own flock).
+        red = next((tgt for tgt, (_branch, wt) in folded.items()
+                    if cfg.regate_between_waves and not dry and wt is not None
+                    and gates.run_integration(cfg, wt, hold_lock=False)
+                    .get("overall") == "fail"), None)
+    return folded, tips, red
+
+
+def _finished_named(cfg: Config, batch: Collection[str] | None,
+                    drive_names: set[str]) -> list[Path]:
+    """The run's finished named ids (#646): each id it was asked for (``batch``) that is
+    COMPLETE and not in the drive set — the caller skipped it as terminal — once, in the
+    order asked for. None without a ``batch``."""
+    found: dict[str, Path] = {}
+    for iid in batch or ():
+        d = cfg.bundle(str(iid).removeprefix("issue_"))
+        if d.name not in drive_names and state.state(d) == state.COMPLETE:
+            found.setdefault(d.name, d)
+    return list(found.values())
+
+
+def _finished_head(d: Path, ref: tuple[str, str, bool] | None, repo: Path, base_ref: str,
+                   tip: str | None) -> str | tuple[str, str]:
+    """Finished bundle ``d``'s PR head when it is state-clean (#646): its PR reads OPEN, or
+    MERGED with the head already on ``base_ref`` or on the line at ``tip``, and the head
+    resolves in ``repo``. Else ``(reason, hint)`` — fail-closed: no recorded PR or branch,
+    or a state that cannot be read, is not clean."""
+    rec = publish._publish_record(d) if ref else None
+    pr_url = rec.get("pr_url") if isinstance(rec, dict) else None
+    if not pr_url:
+        return "no PR with a pushed branch on record (publish.json)", "open"
+    st = merged.pr_state(str(pr_url))
+    if st is None:
+        return f"its PR state could not be read (`gh pr view {pr_url}` failed)", "open"
+    pr, head = st
+    if pr not in ("OPEN", "MERGED"):
+        return f"its PR is {pr}", "open"
+    if not head or integrate._rev(repo, head) is None:
+        return f"its PR head {head or '(none reported)'} is not in {repo}", "open"
+    if pr == "MERGED" and not any(integrate._carries(repo, head, f"{d.name}'s head", r, of=r)
+                                  for r in (base_ref, tip) if r):
+        return f"its PR merged at {head[:12]}, which neither {base_ref} nor the line has", "edge"
+    return head
+
+
+_CARRY_HINTS = {
+    "open": "get {name}'s PR open with its branch on origin (re-open it, `pdca publish {iid}`, "
+            "or re-drive {name}), then re-issue",
+    "edge": "remove the `Depends on: {iid}` edge from the dependent's brief, then re-issue",
+    "line": "delete {line} on origin unless this run's own fold already replaced it, then "
+            "re-issue",
+}
+
+
+def _carry_finished(cfg: Config, bundles: list[Path], finished: list[Path], *,
+                    batch: list[str], integ: dict[tuple[str, str], str],
+                    folded_tips: dict[tuple[str, str], str | None], held: set[str]) -> None:
+    """Before wave 0, put a re-issued run's finished named ids on its line (#646).
+
+    ``finished`` (:func:`_finished_named`) are ids the run was asked for that an earlier run
+    of the batch finished. Nothing happens unless a drive-set bundle's plain ``Depends on``
+    names one the fold can carry (:func:`integrate._fold_candidates`); then every carryable
+    finished id of THAT target is judged, in the order asked for. Clean — its PR state
+    clean (:func:`_finished_head`), origin's line holding nothing else it cannot account for
+    (:func:`integrate.foreign_commit`), merged without error, re-gate not red — it is folded
+    by ONE fold per target (:func:`_fold_lines`), which continues origin's line from the
+    tip checked here (no force; refused if it moved) or starts it when absent. The target
+    is then seeded into ``integ`` / ``folded_tips``: wave 0 is pointed at the line and every
+    later fold continues it. Any other finished id goes into ``held``, so only its plain
+    ``Depends on`` dependents wait (:func:`_runnable`), named with its reason on ONE stderr
+    line; the run goes on. A target the carry did not put to use is not seeded, so the
+    run's first fold of it starts fresh, as today. A dry-run (stub publisher) asks no host
+    and holds nothing: it prints the plan. A prerequisite that is no requested id, such as
+    a split child an earlier run adopted, is not carried: :func:`_runnable` holds its plain
+    ``Depends on`` dependents until its PR merges into their base (#647)."""
+    cands = {d.name: (d, (repo, base), ref)
+             for d, repo, base, _slug, ref in integrate._fold_candidates(finished)}
+    dependents: dict[str, list[str]] = {}
+    for b in bundles:
+        bp = b / "brief.md"
+        for dep in (brief.depends_on(bp) if bp.exists() else []):
+            if cfg.bundle(dep).name in cands:
+                dependents.setdefault(cfg.bundle(dep).name, []).append(b.name)
+    for tgt in sorted({cands[name][1] for name in dependents}):
+        ids = [d for d, t, _ref in cands.values() if t == tgt]          # in the order asked for
+        line = integrate.integration_branch(cfg, tgt[1], batch)
+        if cfg.publisher.mode == "stub":    # dry-run: ask no host, hold nothing
+            print(f"flow: dry-run — before wave 0, carry {', '.join(d.name for d in ids)} "
+                  f"(finished in an earlier run) onto {line} if clean:", file=sys.stderr)
+            integrate.fold(cfg, ids, dry_run=True, batch=batch)
+            continue
+        why: dict[str, tuple[str, str]] = {}    # not clean: name → (reason, hint)
+        heads: dict[str, str] = {}              # state-clean: name → its PR head
+        base_ref, tip, bad = f"{cfg.base_remote}/{tgt[1]}", None, None
+        try:
+            repo, tip = integrate.carry_view(cfg, tgt[0], line, [
+                cands[d.name][2][0] for d in ids if cands[d.name][2]])
+            for d in ids:
+                try:
+                    v = _finished_head(d, cands[d.name][2], repo, base_ref, tip)
+                except integrate.IntegrationError as exc:
+                    v = (str(exc), "open")
+                if isinstance(v, str):
+                    heads[d.name] = v
+                else:
+                    why[d.name] = v
+            bad = integrate.foreign_commit(repo, tip, base_ref, heads.values()) if tip else None
+        except integrate.IntegrationError as exc:
+            why = {d.name: (str(exc), "open") for d in ids}
+        if bad:   # an untrusted line: carry nothing onto it, point nothing at it
+            why = {d.name: (f"origin's {line} holds {bad[:12]}, which neither {base_ref} nor "
+                            f"a finished prerequisite's PR accounts for", "line") for d in ids}
+        clean = [d for d in ids if d.name not in why]
+        if clean:
+            skipped: dict[str, str] = {}
+            try:
+                folded, tips, red = _fold_lines(cfg, clean, dry=False, batch=batch,
+                                                folded_this_run={tgt: tip} if tip else {},
+                                                skipped=skipped)
+            except integrate.IntegrationError as exc:
+                folded, tips, red = {}, {}, None
+                skipped.update({d.name: str(exc) for d in clean})
+            carried = [d.name for d in clean if d.name not in skipped]
+            why.update({name: (msg, "open") for name, msg in skipped.items()})
+            if red:
+                why.update({name: (f"the re-gate of {line} carrying it is red", "open")
+                            for name in carried})
+            elif tgt in folded:
+                integ[tgt], folded_tips[tgt] = folded[tgt][0], tips[tgt]
+                print(f"flow: carried {', '.join(carried)} (finished in an earlier run) onto "
+                      f"{line} at {tips[tgt]} before wave 0 — this run's {tgt[0]} @ {tgt[1]} "
+                      f"bundles build on it.", file=sys.stderr)
+        for d in ids:
+            if d.name in why:
+                held.add(d.name)
+                reason, hint = why[d.name]
+                advice = _CARRY_HINTS[hint].format(name=d.name, line=line,
+                                                   iid=d.name.removeprefix("issue_"))
+                print(f"flow: {d.name} (finished in an earlier run) is not carried onto "
+                      f"{line}: {reason} — holding "
+                      f"{', '.join(dependents.get(d.name, [])) or 'no bundle'} this run; "
+                      f"{advice}.", file=sys.stderr)
 
 
 def _audit_wave_overlap(wave: list[Path]) -> None:
@@ -510,6 +979,66 @@ def _audit_wave_overlap(wave: list[Path]) -> None:
 # stops driving it is work in flight — it will not be published, and nothing else advances
 # it this run.
 _TERMINAL = (state.COMPLETE, state.DISCONTINUED, state.RESOLVED)
+
+
+def _lineage_children(record: dict) -> list[str]:
+    """The child ids a lineage record's ``children`` edge names, or ``[]`` — never raises.
+
+    The value-level half of the tolerance :func:`split.read_lineage` gives the FILE
+    (``split.py:373``), mirroring :func:`split._recorded_depth` (``split.py:405``): the
+    reader abstains on a file it cannot parse, this abstains on a VALUE it cannot format
+    with. ``{"children": 7}`` and ``{"children": [1, null]}`` are valid JSON with a valid
+    ``version``, so the reader hands them straight back — and ``" ".join(...)`` on either
+    raises ``TypeError`` out of :func:`flow_ids`, aborting the run on a hand-edited
+    provenance file exactly as a raising reader would. Tolerating the file but not its
+    contents would only move the throw one line down.
+    """
+    value = record.get("children")
+    if not isinstance(value, list):
+        return []
+    # Stripped, so a hand-added space cannot render an uncopyable `pdca flow " 469 "` hint;
+    # `split.validate` only ever writes `[A-Za-z0-9._-]+` tokens (``split.py:281``).
+    return [c.strip() for c in value if isinstance(c, str) and c.strip()]
+
+
+def _terminal_hint(d: Path, s: str) -> str:
+    """What an operator can DO about a bundle the drive set skipped as terminal, or ``""``.
+
+    One hint, on the one shared path (issue #468). Both ``pdca flow <id>`` and ``pdca flow
+    <id> <id>`` reach a terminal bundle through :func:`flow_ids`'s filter below, so the
+    recovery advice cannot differ by CLI arity — which is exactly how the single-id route
+    came to print ``rm -rf`` at a SPLIT PARENT while the batch route printed a bare skip.
+
+    Deleting a split parent is destructive: its ``split-lineage.json`` (``split.py:47``) is
+    the only on-disk record of the split's edges, so ``rm -rf`` there orphans the children
+    the parent already produced. A record carrying a ``children`` key IS a split parent
+    (independent optional edges, ``children`` iff split — ``split.py:392``), so the key's
+    mere PRESENCE suppresses the destructive advice; only the ability to NAME the children
+    depends on the value being usable (:func:`_lineage_children`).
+    """
+    record = split.read_lineage(d) or {}
+    if "children" in record:
+        kids = _lineage_children(record)
+        if kids:
+            return (f"split into children — nothing to run here; drive them instead with "
+                    f"`pdca flow {' '.join(kids)}`. Do not delete this bundle: its "
+                    f"{split.LINEAGE} is the only on-disk record of the split.")
+        return (f"split into children, but its {split.LINEAGE} names none readably — "
+                f"nothing to run here. Do not delete this bundle; read that file (or the "
+                f"parent's tracker issue) to find the child bundles.")
+    if s == state.RESOLVED:
+        # Verbatim from the single-id CLI short-circuit this shared path replaces
+        # (`cli.py:631-635` on f7876f2). The remediation names the WHOLE file (#302
+        # review round 15): deleting only the `resolved` key would leave the closure-era
+        # notes.json in place, and ensure_notes refuses to re-fetch while it exists — so
+        # Plan would brief from the pre-reopen thread.
+        return ("tracker item resolved outside a cycle — nothing to run. Reopen it in the "
+                "tracker (a reachable GitHub tracker is then picked up here automatically; "
+                "otherwise rename notes.json away — e.g. to notes.superseded-by-reopen.json "
+                "— so the next Plan re-fetches the fresh thread) to plan it again.")
+    if s == state.COMPLETE:
+        return f"already complete — nothing to run. To redo it: rm -rf {d}"
+    return ""
 
 
 def _warn_abandoned(bundles: list[Path], *, why: str) -> None:
@@ -539,25 +1068,711 @@ def _warn_abandoned(bundles: list[Path], *, why: str) -> None:
           file=sys.stderr)
     for d, st in stranded:
         issue_id = d.name.removeprefix("issue_")
-        print(f"flow:   {d.name} [{st}] — resume with `pdca flow {issue_id}`", file=sys.stderr)
+        # …"once this run has ended" (#565): the run still HOLDS every bundle it names here
+        # — it walked away from driving them, not from the run — and goes on to sweep,
+        # publish and Act. A second `pdca flow` over one of them, typed while this run is
+        # alive, is refused; the command is the right one, its time is after this run.
+        print(f"flow:   {d.name} [{st}] — resume with `pdca flow {issue_id}` once this run "
+              f"has ended (it still holds this bundle)", file=sys.stderr)
+
+
+def _report_held(held: dict[str, str]) -> None:
+    """The per-name "held this run" report of the resume path's tolerance (#191).
+
+    ONE definition, read by :func:`flow_batch`'s resume sweep and by split adoption
+    (#469), so the two cannot drift: a bundle whose declared dependency cannot be resolved
+    is named, left in-flight, and the run carries on — an unschedulable bundle never aborts
+    a run.
+
+    What the hold COSTS the run is the CALLER's, and this line promises nothing about it: a
+    held ADOPTED CHILD is dropped from the drive set and the results map (work this run
+    created and could not schedule is not work it did, :func:`_adopt_split_children`), while
+    a held id the operator NAMED stays in the map as PLANNED and the run FAILS, because a run
+    owes an answer for every id it was given
+    (``test_a_named_id_in_the_re_scheduled_tail_is_held_not_lost``).
+    """
+    for name, reason in sorted(held.items()):
+        print(f"flow: {name} held this run — {reason}; left in-flight (resolve it, then "
+              f"re-run).", file=sys.stderr)
+
+
+def _excluded(d: Path, what: str, why: drive_claim.Refusal) -> None:
+    """The one line for a bundle this run reached IMPLICITLY — the CSV sweep, a split's
+    children — and may not drive (#565): another live run holds it, or this run could not
+    record a claim on it. Exclusion, not refusal: nobody named it, so the run goes on with
+    the rest. ``what`` is how it was reached, in the shape of :func:`_report_refused`'s own
+    "NOT adopted: …" reports."""
+    iid = d.name.removeprefix("issue_")
+    if why.held:
+        print(f"flow: {d.name} — {what}: {why.reason}, so it is that run's to drive (if it "
+              f"ends without finishing it, resume it with `pdca flow {iid}`)", file=sys.stderr)
+    else:
+        print(f"flow: {d.name} — {what}: {why.reason}. To drive it, {why.remedy}, then "
+              f"resume it with `pdca flow {iid}`", file=sys.stderr)
+
+
+# ----------------------------------------------------------------------------
+# Split adoption (issue #469, mechanics from #449) — a bundle that reaches
+# ``close-disposition = split`` WHILE THIS RUN IS DRIVING IT hands its children back to the
+# run, instead of stranding them PLANNED for a hand-typed ``pdca flow <child-ids>``.
+#
+# Implemented ONCE, on the shared drive path (#468): ``cli._flow`` routes BOTH CLI shapes
+# through :func:`flow_ids` → :func:`_drive_and_act`, and ``flow_batch``'s drive phase is
+# that same call — so entry-point parity here is structural, not something two
+# implementations have to be kept in step about (which is exactly what five iterations of
+# #449 could not do).
+#
+# Adoption follows the LINEAGE EDGE, never the disk: a run adopts the children of the
+# bundles IT IS DRIVING (transitively — an adopted child that splits in its turn is adopted
+# in ITS wave), so the deliberate difference between ``flow_ids`` and the CSV resume sweep
+# survives. It is bounded by ADOPTION, not by arithmetic (#473): a bundle already in the
+# drive set is never adopted again, a candidate is examined at most once per splice, and
+# every adopted child is a bundle already on disk — so each splice consumes a finite set and
+# a chain of splits stops. The pass pool then funds every wave that chain produced
+# (:func:`_pass_pool`) instead of truncating a schedule the run itself created.
+#
+# A bundle ALREADY terminal on a split when the run STARTS is the RECOVERY case (#473) — the
+# children an earlier run (a crash, a ``^C``, a split accepted in another session) left
+# PLANNED. ``flow_ids`` still SKIPS such an id, because a terminal bundle has nothing to
+# build, and still prints :func:`_terminal_hint`'s non-destructive advice; what is new is
+# that it hands the bundle on as an adoption SEED. The seed's children are spliced by this
+# same code at ``k = -1`` ("the wave before wave 0"), under the same guards, the same
+# reschedule and the same announcements a mid-run split gets — recovery is one more USE of
+# the adoption path, never a second mechanism beside it.
+# ----------------------------------------------------------------------------
+#: The close-disposition ``split.accept`` writes into a parent it has decomposed
+#: (``split.py:635``). Spelled here rather than imported because the split command owns
+#: that write; this module only READS the marker it leaves.
+SPLIT_DISPOSITION = "split"
+
+#: The only id shape a lineage record can legitimately name. ``split.validate`` refuses
+#: anything else at WRITE time — "ids may hold letters, digits, dot, underscore and hyphen
+#: only" (``split.py:297``) — so this is the reader's half of that rule, mirrored rather
+#: than imported (the split command owns what it writes; this module owns what it is
+#: willing to drive, and the record between them is a file an operator can hand-edit).
+#: Enforcing it here is what lets every branch below interpolate the id and the bundle name
+#: into a report unquoted: a value containing a newline would otherwise break one stderr
+#: line into two, the same "uncopyable hint" hazard :func:`_lineage_children`'s strip
+#: (``flow.py:694``) exists to close. ``.`` / ``..`` need no special case (the writer
+#: excludes them, ``split.py:297``): ``cfg.bundle`` prefixes ``issue_``, so they can only
+#: ever name the ordinary directories ``issue_.`` / ``issue_..``, never a parent.
+_PLAIN_ID = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def _real(p: Path) -> Path | None:
+    """``p`` with every symlink resolved, or ``None`` if it will not resolve (a symlink loop,
+    a permission wall). ONE resolver, so adoption's two questions about a path — really
+    inside the bundle root (:func:`_inside_bundle_root`)? really a directory this run already
+    drives (:func:`_adoptable`)? — cannot answer with different notions of "really". Both
+    callers refuse a ``None``; neither ever raises."""
+    try:
+        return p.resolve()
+    except Exception:  # noqa: BLE001 — a path that will not resolve is not one this can
+        # vouch for. Refuse it; never raise.
+        return None
+
+
+def _inside_bundle_root(cfg: Config, d: Path) -> bool:
+    """True iff ``d`` is REALLY a direct child of the bundle root — symlinks resolved.
+
+    Containment has to be decided on the RESOLVED path. ``cfg.bundle`` builds
+    ``<bundle_root>/issue_<id>``, whose ``.parent`` is the bundle root by construction, so a
+    lexical comparison answers "inside" for an ``issue_<id>`` that is a **symlink** to a
+    directory anywhere on the filesystem — and the run would then drive, sign off and
+    publish from a bundle outside the instance. Both sides are resolved, so an instance
+    whose own root is reached through a symlink (a symlinked checkout, ``/tmp`` →
+    ``/private/tmp``) still compares equal, and a child with no bundle yet resolves to its
+    own canonical path — the "no brief.md" report is the one that names that case.
+
+    Lexical traversal (``"../../etc"``) is NOT this guard's job and must not be left to it:
+    ``realpath`` NORMALISES ``results/issue_../../etc`` back to ``results/etc``, which is
+    inside the root by this test. :data:`_PLAIN_ID` rejects those ids before a path is ever
+    built; the two guards are complementary, neither is redundant.
+
+    A link that stays INSIDE the root (one ``issue_<id>`` aliasing another bundle) passes THIS
+    test, and should: it names a bundle this instance owns. The hazard it carries — one
+    DIRECTORY entering the run twice under two names — takes the run's drive set to see, so it
+    is refused in :func:`_adoptable`, not by re-keying that run's sets by resolved path.
+    """
+    real, root = _real(d), _real(cfg.bundle_root)
+    return real is not None and root is not None and real.parent == root
+
+
+def _is_split_parent(d: Path) -> bool:
+    """True iff ``d`` is terminal AND its close marker records a ``split``.
+
+    Terminal is part of the predicate on purpose. ``split.accept`` writes the marker
+    (``split.py:635``), but the human still confirms the decomposition at sign-off — the
+    close fast path raises a §6 NEEDS-HUMAN for exactly that — so a parent still
+    AWAITING_SIGNOFF (or sent back with ``iterate-do``) is a split nobody has accepted yet,
+    and driving its children would spend whole cycles on work the next sign-off may reopen.
+    Same predicate as :func:`_warn_abandoned`'s (``flow.py:759``): "not terminal" means
+    "still in flight".
+
+    The catch is TOTAL, for the reason the sibling reader this builds on spells out
+    (:func:`split.read_lineage`, ``split.py:382-390``): a ``close-disposition`` whose bytes
+    are not UTF-8 raises ``UnicodeDecodeError`` out of the *read*, where only ``OSError``
+    was expected. A marker that cannot be read is not a split; it is never a verdict on the
+    run.
+    """
+    if state.state(d) not in _TERMINAL:
+        return False
+    try:
+        return (d / state.CLOSE_MARKER).read_text(
+            encoding="utf-8").strip() == SPLIT_DISPOSITION
+    except Exception:  # noqa: BLE001 — a hint that cannot be read must never end a run
+        return False
+
+
+def _has_plan_artifact(cfg: Config, d: Path) -> bool:
+    """True iff ``d`` may enter this run's drive set: it has a ``brief.md`` — or is given one
+    here, when it is a split parent a pre-#481 ``split --accept`` left without one (#597).
+
+    The flow never drives a bundle with no Plan artifact: Do, Check, sign-off and publish
+    all read the brief, and the first read (``_point_at_integration`` →
+    ``publish._resolve_target``) raised ``FileNotFoundError`` out of the whole run. The
+    intake filters only ever asked "UNPLANNED?", and a briefless bundle carrying a close
+    marker or a ``patch.diff`` is past Do by :func:`state.state`'s own contract (#481), so
+    it slipped through as BUILT. Called by every intake path — :func:`flow_ids`,
+    :func:`flow_batch`'s sweep and :func:`_adopt_split_children` — and only AFTER the run
+    holds the bundle's claim (#565), so a bundle another live run drives is never written.
+
+    * A bundle with its own ``brief.md`` is never opened, let alone rewritten.
+    * A split parent with none gets exactly what ``split --accept`` writes since #481
+      (``split.py:937-939``): :func:`split._parent_plan` over its iterate-to-Plan archive,
+      rendered by :func:`split._split_parent_brief` with the lineage record's children as
+      bundle names, in record order. Reused, never re-implemented, so the two cannot drift.
+    * Everything else — no usable archive, no usable children record, a briefless bundle
+      that is not a split parent, a write that fails — is named on stderr with what to do,
+      and kept out of the run. Never raises.
+    """
+    if (d / "brief.md").exists():
+        return True
+    iid = d.name.removeprefix("issue_")
+    try:
+        marker = (d / state.CLOSE_MARKER).read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001 — absent or unreadable: not a split parent
+        marker = ""
+    if marker != SPLIT_DISPOSITION:
+        print(f"flow: {d.name} — no brief.md, NOT driven: it is past Do (a close marker or "
+              f"patch.diff) with no Plan artifact, and a bundle is never driven without one. "
+              f"Restore {d.name}/brief.md (an iterate-to-Plan archives it as "
+              f"iteration-v<N>/brief.md), then `pdca flow {iid}`", file=sys.stderr)
+        return False
+    try:
+        plan = split._parent_plan(d, cfg)
+    except Exception as exc:  # noqa: BLE001 — skips this bundle, never the run
+        # A SplitError is worded for `split --accept`: its reason, then "— refusing to
+        # split" and that command's own retry. Only the reason belongs in a flow run; the
+        # one remedy is the flow's.
+        why = (str(exc).partition(" — refusing to split")[0]
+               if isinstance(exc, split.SplitError) else f"{type(exc).__name__}: {exc}")
+        print(f"flow: {d.name} — split parent NOT driven: {why}. Write {d.name}/brief.md "
+              f"(slug, success criterion, repo + branch target), then `pdca flow {iid}`",
+              file=sys.stderr)
+        return False
+    if plan is None:
+        # `_parent_plan`'s "it has its own brief.md" (split.py:805-806): written since the
+        # check at the top, by a writer the claim does not fence (drive_claim.py:42-46).
+        return True
+    children = _lineage_children(split.read_lineage(d) or {})
+    if not children:
+        print(f"flow: {d.name} — split parent with no brief.md, NOT driven: its "
+              f"{split.LINEAGE} is missing, unreadable or names no children, so the brief "
+              f"`split --accept` writes (which lists them) cannot be rebuilt. Write "
+              f"{d.name}/brief.md (slug, success criterion, repo + branch target), then "
+              f"`pdca flow {iid}`", file=sys.stderr)
+        return False
+    text = split._split_parent_brief(d, plan, [cfg.bundle(c).name for c in children])
+    tmp = d / ".brief.md.rebuild"
+    try:
+        # Whole or not at all: a half-written brief.md would read as the bundle's OWN brief
+        # on the next run, and is never rewritten again.
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(d / "brief.md")
+    except Exception as exc:  # noqa: BLE001 — a failed write skips this bundle, never the run
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        print(f"flow: {d.name} — split parent with no brief.md, NOT driven: rebuilding it "
+              f"from {plan[0]} failed ({exc}). Write {d.name}/brief.md, then "
+              f"`pdca flow {iid}`", file=sys.stderr)
+        return False
+    print(f"flow: {d.name} — split parent had no brief.md (its split was accepted before "
+          f"#481); rebuilt it from {plan[0]}, as `pdca split --accept` writes it",
+          file=sys.stderr)
+    return True
+
+
+def _admit(cfg: Config, d: Path, claims: drive_claim.Run | None) -> bool:
+    """:func:`_has_plan_artifact` for one intake path, letting go of the claim on a bundle
+    it keeps out — this run will not drive it, so the ``pdca flow <id>`` it was told to run
+    must not be refused by this very run (#565)."""
+    if _has_plan_artifact(cfg, d):
+        return True
+    if claims is not None:
+        claims.release(d)
+    return False
+
+
+def _adoptable(cfg: Config, parent: Path, *, known: set[str],
+               refused: list[tuple[str, str, str]]) -> tuple[list[Path], list[Path]]:
+    """The children of ``parent`` this run can drive, and the ones to WALK THROUGH —
+    ``([], [])`` unless it split.
+
+    Detect and validate in ONE step: a bundle that is not terminal on a ``split``
+    (:func:`_is_split_parent`) has no adoptable children, so no caller can decide "is this a
+    split" a second way.
+
+    The ids come from the parent's ``split-lineage.json`` (:func:`split.read_lineage`,
+    ``split.py:373``), read through the same tolerant :func:`_lineage_children` the terminal
+    hint uses (``flow.py:679``) — a READ of a machine-readable record, never a parse of the
+    prose breadcrumb ``accept`` leaves in ``build-notes.md`` (``split.py:627-634``), which
+    is written for a human and is not a contract. A parent carrying the marker but no
+    readable record is reported and skipped: that degrades to the operator's ``pdca flow
+    <child-ids>``, never a crash and never a guess.
+
+    EVERY entry is accounted for out loud, including the ones that never reach the loop:
+    ``_lineage_children`` drops what it cannot format with (a non-string, an empty string)
+    before this sees it, and a child dropped THERE would be stranded in silence — never
+    adopted, never named, the operator left reading a sibling's ``unresolved dependency
+    (601)`` as if 601 did not exist while a briefed bundle sits in the next directory. So what
+    it refused is counted here from its own answer, never a second copy of its predicate.
+
+    Each id is then filtered exactly as :func:`flow_ids` filters an explicitly named one: a
+    bundle that does not exist or has no brief, and one already terminal, is named and
+    dropped. An id LISTED TWICE yields one child, and an id that is not a plain tracker id
+    (:data:`_PLAIN_ID`) or whose bundle is not really inside the bundle root
+    (:func:`_inside_bundle_root`) is dropped as well — the record is a file an operator can
+    hand-edit, and ``cfg.bundle`` would happily build a path outside the root (the hazard
+    ``split.validate`` guards at write time, ``split.py:297-311``) or the same bundle twice
+    (which would enter the wave computation, the drive set and the announcement twice over).
+
+    "The same bundle" is decided on the RESOLVED directory, not the name alone, because two
+    names can be one bundle: an ``issue_<id>`` symlinked to another inside the root passes
+    :func:`_inside_bundle_root` by design, and adopting it beside the bundle it aliases puts
+    one directory in one wave twice — under ``lanes > 1``, two lanes on one bundle.
+
+    One skip is NOT reported here: a child already in ``known`` — this run's drive set plus
+    what a sibling parent has just claimed — is appended to ``refused`` for the caller to
+    report AFTER the splice (:func:`_report_refused`), with the name the run holds that
+    DIRECTORY under (the child's own, except for an alias), since that is the name whose
+    disposition the report looks up. What is true about such a child is not yet decided at
+    this point in the run, and the eager line said the wrong one of the two.
+
+    One dropped child is not a dead end (#473). A child that is terminal **on a split of its
+    own** cannot be driven — but the generation below it can still be sitting where an
+    earlier run left it (a 500 → 601 → 701 chain abandoned part-way down). Those come back
+    as the SECOND return value, for the caller's queue, so the walk continues by re-entering
+    this reader under that child's name — with these same guards, and its grandchildren
+    attributed to the parent that actually declared them — rather than by a second reader of
+    the same lineage record. It is a pair, not one list, because the two are different
+    claims: the first is work this run takes on, the second is a bundle to ASK about.
+    """
+    if not _is_split_parent(parent):
+        return [], []
+    record = split.read_lineage(parent) or {}  # tolerant by contract: never raises
+    ids = _lineage_children(record)
+    entries = record.get("children")
+    entries = entries if isinstance(entries, list) else []
+    if len(entries) > len(ids):
+        # The record is echoed so the operator can recognise the child it failed to name —
+        # bounded, and `repr`-quoted so a newline inside an entry cannot break the line in two.
+        head, more = entries[:8], (f" (first 8 of {len(entries)})" if len(entries) > 8 else "")
+        print(f"flow: {parent.name} — {len(entries) - len(ids)} of the {len(entries)} "
+              f"entries in {split.LINEAGE}'s `children` name no usable child id, so they "
+              f"were NOT adopted: the record reads {head!r}{more}. Repair that file (or "
+              f"drive them by hand with `pdca flow <child-ids>`) — a child it fails to name "
+              f"is a bundle nothing in this run will drive.", file=sys.stderr)
+    if not ids:
+        print(f"flow: {parent.name} — close-disposition '{SPLIT_DISPOSITION}' but no "
+              f"readable children record ({split.LINEAGE}); its children were NOT adopted "
+              f"— drive them with `pdca flow <child-ids>`", file=sys.stderr)
+        return [], []
+    # The run's drive set as DIRECTORIES: `known` is keyed by name, and the name a bundle is
+    # driven under is not the only one that can reach it. First name wins, sorted, so the one
+    # reported does not depend on set iteration order.
+    driven: dict[Path, str] = {}
+    for name in sorted(known):
+        root_real = _real(cfg.bundle_root / name)
+        if root_real is not None:
+            driven.setdefault(root_real, name)
+    out: list[Path] = []
+    walk: list[Path] = []          # terminal on a split of their own — asked, not driven
+    seen: set[str] = set()
+    seen_real: set[Path] = set()
+    for cid in ids:
+        d = cfg.bundle(cid)
+        if d.name in seen:
+            # One bundle, one adoption. A hand-edited record listing a child twice (or twice
+            # in two spellings that resolve to one bundle) would otherwise be adopted twice:
+            # duplicated into `remaining + children` for the reschedule, counted twice in the
+            # drive set, and announced twice. Deduped on the resolved bundle name, not on the
+            # raw id, because that is what every downstream set is keyed by.
+            continue
+        seen.add(d.name)
+        if not _PLAIN_ID.fullmatch(cid):
+            print(f"flow: {parent.name} — ignoring child id {cid!r} in {split.LINEAGE}: it "
+                  f"is not a plain tracker id (letters, digits, dot, underscore and hyphen "
+                  f"only — the one shape `pdca split --accept` writes), so it names no "
+                  f"bundle under {cfg.bundle_root}", file=sys.stderr)
+            continue
+        real = _real(d)
+        if real is None or not _inside_bundle_root(cfg, d):
+            print(f"flow: {parent.name} — ignoring child id {cid!r} in {split.LINEAGE}: "
+                  f"{d.name} resolves outside {cfg.bundle_root} (a symlinked bundle is not "
+                  f"this instance's to drive)", file=sys.stderr)
+            continue
+        if real in seen_real:
+            # The alias half of "one bundle, one adoption": a second entry in THIS record
+            # reaching the same directory through a link. Silent like the duplicate name above
+            # and for its reason — that directory IS adopted, under the first name that
+            # reached it, so nothing is stranded and there is nothing to resume.
+            continue
+        seen_real.add(real)
+        owner = d.name if d.name in known else driven.get(real, "")
+        if owner:
+            # Named, not silent — but named by the CALLER, once the splice has run. `known`
+            # is `batch_names | taken`, and a child a sibling parent `taken` a moment ago can
+            # still be HELD by the reschedule that follows: "already in this run's drive set"
+            # would then be a false statement about the run at exactly the moment an operator
+            # is reading the log to find out who owns that child. `owner` is that child's own
+            # name, except through a link — then it is the name the run drives the directory
+            # under, the one with a disposition to report.
+            refused.append((parent.name, d.name, owner))
+            continue
+        s = state.state(d)
+        if not d.exists() or s == state.UNPLANNED:
+            print(f"flow: {d.name} — child of {parent.name} NOT adopted: no brief.md "
+                  f"(brief it at Plan, then `pdca flow {cid}`)", file=sys.stderr)
+            continue
+        if s in _TERMINAL:
+            if _is_split_parent(d):
+                # Terminal AND split: nothing to drive HERE, but this is the only route to
+                # a generation an earlier run may have stranded below it. Handed back to
+                # the caller's queue instead of dropped, so recovery reaches the whole brood
+                # rather than stopping at the first child that already closed.
+                print(f"flow: {d.name} — child of {parent.name} is itself terminal on a "
+                      f"split; examining it for children to adopt", file=sys.stderr)
+                walk.append(d)
+            else:
+                print(f"flow: {d.name} — child of {parent.name} NOT adopted: already "
+                      f"terminal ({s})", file=sys.stderr)
+            continue
+        out.append(d)
+    return sorted(out, key=lambda p: p.name), sorted(walk, key=lambda p: p.name)
+
+
+def _reschedule(cfg: Config, remaining: list[Path]) -> list[list[Path]] | None:
+    """Wave-order what is LEFT of the run together with the newly adopted children.
+
+    The resume path's TOLERANCE (:func:`waves.partition_schedulable` + the per-name
+    :func:`_report_held`), not :func:`waves.compute_waves`' strictness: a child whose
+    declared dependency cannot be resolved — or that sits in a cycle — is held, reported
+    and left in-flight while the run carries on. A split must never be able to abort the
+    flow that caused it. ``None`` iff not even that could be computed, which leaves the
+    caller with today's waves (and says so) rather than a half-spliced run.
+    """
+    try:
+        schedulable, held = waves.partition_schedulable(cfg, remaining)
+        _report_held(held)
+        # partition_schedulable's contract: the remainder is a valid DAG compute_waves
+        # levels without raising. The try still covers it — adoption is an enhancement,
+        # and no enhancement may take down a run that is already producing results.
+        return waves.compute_waves(cfg, schedulable) if schedulable else []
+    except Exception as exc:  # noqa: BLE001 — deliberately broad: never abort the run
+        print(f"flow: could not re-wave the run after a split "
+              f"({type(exc).__name__}: {exc})", file=sys.stderr)
+        return None
+
+
+def _report_refused(refused: list[tuple[str, str, str]], batch_names: set[str]) -> None:
+    """Say what became of each child adoption refused as a duplicate — AFTER the splice.
+
+    A refusal is only half an answer when it is made. ``known`` is ``batch_names | taken``
+    (:func:`_adopt_split_children`), and the ``taken`` half is a claim, not a schedule: the
+    reschedule that follows can HOLD that child (:func:`_reschedule`), and a later one can
+    drop a child adopted earlier back out of the run. Reported eagerly, one child then drew
+    two lines that contradict each other — ``already in this run's drive set`` beside
+    ``held this run — …; left in-flight`` — while it sat in neither the drive set nor the
+    results map, which is precisely the "one situation, two report shapes" this feature
+    exists to end.
+
+    So the line is written here, against the drive set as it FINALLY stands after the
+    splice, and there is exactly one shape per outcome: it IS in the run (skip it, the
+    other parent has it), or it is not (nobody in this run owns it — resume it by hand).
+    Pinned by ``test_a_shared_child_the_reschedule_holds_is_not_reported_as_driven``.
+
+    The disposition looked up is the OWNER's — the name the run holds that directory under,
+    the child's own except through a symlinked ``issue_<id>`` (pinned by
+    ``test_a_symlinked_alias_of_a_bundle_this_run_drives_is_driven_once``). Looking the alias
+    up instead finds nothing and says the run does not own a bundle it is driving under its
+    other name; the line names both, so one directory under two names reads as that.
+    """
+    for parent_name, child, owner in refused:
+        alias = "" if owner == child else f" (the same directory as {owner})"
+        if owner in batch_names:
+            print(f"flow: {child} — child of {parent_name} not adopted again: already in "
+                  f"this run's drive set{alias}", file=sys.stderr)
+        else:
+            print(f"flow: {child} — child of {parent_name} NOT adopted: another parent in "
+                  f"this run claimed it first and it is not scheduled — it is NOT in this "
+                  f"run's drive set or its results; resume it with `pdca flow "
+                  f"{child.removeprefix('issue_')}`{alias}", file=sys.stderr)
+
+
+def _refused_child(claims: drive_claim.Run, parent: Path, child: Path) -> bool:
+    """Claim ``child`` for this run's adoption (#565); True — and the child named — when
+    this run may not drive it."""
+    why = claims.take(child)
+    if why is not None:
+        _excluded(child, f"child of {parent.name} NOT adopted", why)
+    return why is not None
+
+
+def _adopt_split_children(cfg: Config, candidates: list[Path], *, k: int,
+                          wave_list: list[list[Path]], bundles: list[Path],
+                          batch_names: set[str], named: frozenset[str],
+                          claims: drive_claim.Run | None = None) -> None:
+    """Splice the children of any bundle in ``candidates`` that has split into the waves
+    AFTER ``k``, and announce each child's REAL wave. ``k`` is the wave just driven; ``-1``
+    is the pre-pass over the run's adoption SEEDS (#473) — ids the operator named whose
+    bundles were ALREADY terminal on a split when the run started — whose children are
+    levelled in front of the whole schedule (``wave_list[-1 + 1:]`` is ``wave_list[0:]``).
+
+    ``candidates`` seeds a work QUEUE, not a list read once: a child that is itself terminal
+    on a split comes back from :func:`_adoptable` and is examined in its turn, under its own
+    name, so a chain an earlier run abandoned part-way down (500 → 601 → 701, with 601
+    already split) hands over the descendants that are ACTUALLY stranded instead of stopping
+    at the first closed generation. Each bundle leaves the queue at most once, so a
+    hand-edited record naming an ancestor drains rather than spins.
+
+    Mutates the run's state in place: ``wave_list[k+1:]`` is replaced by the recomputed
+    remainder (so the children join a wave AFTER the one their parent was in — never the
+    wave being driven, whose fold has a base about to move, and never one that has already
+    folded), and the scheduled children join ``bundles`` / ``batch_names``, the sets the
+    results map, the final :func:`_sweep_quietly` and :func:`_runnable`'s in-batch prereq
+    rule already cover. They are pointed at this run's per-target integration branch by the
+    ordinary :func:`_point_at_integration` call at the top of their wave (``flow.py:1424``),
+    and driven by the ordinary :func:`_drive_wave` out of the run's own pass budget — one
+    mechanism, not a second.
+
+    The announced wave is READ BACK from the recomputed schedule, never assumed to be the
+    parent's index + 1: the children are levelled by their own ``Depends on`` /
+    ``Conflicts with``, so two children of one parent routinely land in different waves and
+    a hardcoded ``k + 1`` names a wave the second one is not in. A child the reschedule
+    HELD is not announced as adopted at all, and never joins the results map —
+    :func:`_report_held` has already named it as left in-flight.
+
+    ``named`` is the set of bundles the run SET OUT to drive, and it is what makes that
+    exclusion hold whenever the hold happens rather than only the first time. Each splice
+    re-levels the WHOLE un-driven tail, so a child adopted into a later wave can be held by
+    a LATER call — its prerequisite ended the run un-terminal, or its brief was re-planned
+    onto one this run cannot resolve. Held is held: such a child is taken back out of
+    ``bundles`` / ``batch_names`` and its adoption announcement RETRACTED on stderr, so the
+    same situation ("this run created work it could not schedule") cannot produce two
+    different report shapes — and two different exit codes — depending only on WHICH
+    reschedule first saw it (``test_a_child_held_by_a_later_reschedule_leaves_the_run``).
+    An id the operator NAMED is never dropped that way: the run owes an answer for every id
+    it was given, so a held one stays in the map (``flow.py:1370-1379``,
+    ``test_a_named_id_in_the_re_scheduled_tail_is_held_not_lost``).
+
+    Adoption is bounded, and since #473 it is what bounds the RUN: a child already in the
+    drive set is never re-adopted (``known``), a candidate leaves the queue once
+    (``examined``), and every adopted child is a bundle already on disk — so each splice
+    strictly consumes a finite set, and the schedule :func:`_pass_pool` funds cannot grow
+    forever. (A child RETRACTED above is no longer in the set, so a later parent naming it
+    may take it up again; each such round still needs a fresh split.) An adopted child that
+    splits LATER, while this run drives it, is picked up by this same call in ITS wave — a
+    recursion bound, not a recursion reset: nothing gives the run back what it has already
+    spent, and no wave ever gets a second allowance. Either way the scope stays "the children
+    of the bundles this run is driving, transitively" and never becomes a glob of
+    ``results/``.
+
+    ``known`` is ``batch_names | taken``, and it needs both halves: ``taken`` dedupes WITHIN
+    one call — two parents that split in the SAME wave, the second's record also naming the
+    first's child (``test_two_parents_splitting_in_one_wave_adopt_a_shared_child_once``) —
+    while ``batch_names``, which this call grows, is the only thing that carries an adoption
+    ACROSS calls, so a later wave's parent whose record names a child an earlier wave
+    already adopted is skipped rather than scheduling, driving and announcing one bundle
+    twice (``test_a_child_adopted_earlier_is_not_re_adopted_by_a_later_parent``).
+
+    The two halves differ in one respect that is invisible in the dedup and load-bearing in
+    the REPORT: ``batch_names`` is a schedule, ``taken`` is only a claim — the reschedule
+    below can still hold that child. So a refusal is collected, not printed, and answered
+    by :func:`_report_refused` once the splice has settled which of the two it was.
+
+    ``claims`` (#565) is the CLI run's. A child is adopted only once this run has CLAIMED
+    it, right after :func:`_adoptable` has vouched for it — so a child another live run
+    drives, or one whose claim cannot be recorded, is named (:func:`_excluded`) and left
+    alone while the rest of the adoption goes on. The claim covers the children the run
+    DRIVES, so one this splice does not schedule — held, retracted, or left over by a
+    reschedule that failed — is let go again at the end: it is left in flight with a
+    command to resume it, and that command must not be refused by the run that has just
+    stopped driving it. ``None`` (a library call) claims nothing.
+
+    Two things this deliberately does NOT do, both visible in a run and neither a
+    consequence anyone should have to rediscover from the code:
+
+    * A bundle that declared ``Depends on <parent>`` is levelled by its OWN edges, not
+      re-pointed at the children the parent decomposed into — so it can share a wave with
+      them. Its base is no worse than before adoption existed (a split parent closes with no
+      patch either way), but the fold grouping is new. Re-pointing a dependent is a
+      ``waves`` semantics change, deliberately out of this scope.
+    * A child the reschedule HELD is excluded from the results map — on the call that
+      adopts it, and equally on a later one that holds it again (it is dropped back out) —
+      so a run whose only unfinished work is a held child still exits 0. That is the
+      contract asked for: a held CHILD — work this run created, not work it was asked for —
+      is not counted as work the run did (a held NAMED id stays in the map instead), and the
+      hold itself is loud (:func:`_report_held`). But it does mean "this run created work it
+      could not schedule" is reported on stderr rather than in the exit code.
+    """
+    adopted: list[tuple[Path, list[Path]]] = []
+    taken: set[str] = set()
+    # (parent, child, the name the run holds that child's DIRECTORY under) — skipped as
+    # already-claimed, answered by `_report_refused` once the splice has settled which.
+    refused: list[tuple[str, str, str]] = []
+    # A work queue (not the `queue` MODULE this file imports): a child terminal on a split
+    # of its own re-enters it under its own name, and `examined` lets each bundle leave it
+    # once — so the walk drains on any record, including a hand-edited one naming an
+    # ancestor. `pop(0)` keeps it breadth-first, so a generation is examined before the one
+    # below it and the announcements read in lineage order.
+    to_examine = list(candidates)
+    examined: set[str] = set()
+    while to_examine:
+        parent = to_examine.pop(0)
+        if parent.name in examined:
+            continue
+        examined.add(parent.name)
+        # `_isolate` returns None iff the read RAISED: that candidate then contributes
+        # neither children nor a walk-through, and the run carries on (its own report).
+        got = _isolate(parent, "split adoption", lambda parent=parent: _adoptable(
+            cfg, parent, known=batch_names | taken, refused=refused))
+        kids, onward = got or ([], [])
+        if claims is not None:
+            # Claimed only now, once `_adoptable` has vouched for each child (#565): a
+            # child this run may not drive is named here and left out of `taken`.
+            kids = [c for c in kids if not _refused_child(claims, parent, c)]
+        # Only now, with the claim held: a child adopted into the run has a brief (#597).
+        kids = [c for c in kids if _admit(cfg, c, claims)]
+        to_examine += onward      # a generation that already closed is walked THROUGH
+        if kids:
+            taken |= {c.name for c in kids}
+            adopted.append((parent, kids))
+    # One exit, so every refusal is answered on every path — including the two where nothing
+    # is spliced (nothing adoptable; the reschedule failed). `wave_of` stays empty there, so
+    # the announcement below prints nothing and `_report_refused` reads an unchanged drive
+    # set: a child refused against a claim that never became a schedule is reported as the
+    # run's non-owner, not as work in flight.
+    wave_of: dict[str, int] = {}
+    dropped: list[Path] = []     # claimed for this run, then not scheduled — let go below
+    if adopted:
+        children = [c for _parent, kids in adopted for c in kids]
+        remaining = [d for w in wave_list[k + 1:] for d in w]
+        tail = _reschedule(cfg, remaining + children)
+        if tail is None:
+            # Not spliced at all: this run drives none of them, and the line below hands
+            # the operator a `pdca flow <child-ids>` that must not be refused by it (#565).
+            dropped = children
+            parents = ", ".join(p.name for p, _kids in adopted)
+            print(f"flow: the children of {parents} could not be scheduled; they are left "
+                  f"in-flight — drive them with `pdca flow "
+                  f"{' '.join(c.name.removeprefix('issue_') for c in children)}`",
+                  file=sys.stderr)
+        else:
+            wave_list[k + 1:] = tail      # the enumerate() in _drive_and_act picks the tail up
+            wave_of = {d.name: k + 1 + j for j, w in enumerate(tail) for d in w}
+            scheduled = [c for c in children if c.name in wave_of]
+            bundles += scheduled
+            batch_names |= {c.name for c in scheduled}
+            # The other end of that rule: a child an EARLIER call adopted, still un-driven,
+            # that THIS reschedule holds. It is gone from the schedule (it is not in `tail`),
+            # so leaving it in the drive set would report a bundle this run neither drove nor
+            # intends to — the very "excluded from the results map" the held report promises,
+            # honoured only when the FIRST reschedule happened to be the one that held it.
+            # Dropped from both sets, and the earlier announcement retracted by name, next to
+            # `_report_held`'s reason.
+            retracted = sorted(d.name for d in remaining
+                               if d.name not in named and d.name not in wave_of)
+            gone = set(retracted)
+            # Everything this splice claimed or had claimed and is NOT driving after all
+            # (#565): a child this reschedule held on the way in, and one an EARLIER call
+            # adopted that this one retracts. Both are left in flight under a resume
+            # command, so both stop being this run's.
+            dropped = ([c for c in children if c.name not in wave_of]
+                       + [d for d in remaining if d.name in gone])
+            if retracted:
+                bundles[:] = [d for d in bundles if d.name not in gone]
+                batch_names -= gone
+                for name in retracted:
+                    print(f"flow: {name} — adopted earlier this run, now held: it is NOT "
+                          f"scheduled and NOT in this run's results (the earlier adoption "
+                          f"line no longer stands)", file=sys.stderr)
+    if claims is not None:
+        for d in dropped:
+            claims.release(d)
+    _report_refused(refused, batch_names)
+    for parent, kids in adopted:
+        by_wave: dict[int, list[str]] = {}
+        for c in kids:
+            if c.name in wave_of:
+                by_wave.setdefault(wave_of[c.name], []).append(c.name)
+        for idx in sorted(by_wave):
+            print(f"flow: {parent.name} split → adopted children "
+                  f"{', '.join(sorted(by_wave[idx]))} into wave {idx}", file=sys.stderr)
+
+
+def _pass_pool(allowance: int, wave_list: list[list[Path]]) -> int:
+    """The run's pass pool: one wave ``allowance`` for every wave the schedule holds RIGHT
+    NOW — the waves the run set out to drive AND the ones adoption has spliced in (#473).
+
+    Sized ONCE, before the loop, the pool was a promise the run could not keep: a splice
+    pushes work into waves the arithmetic never counted, and the run then abandons bundles it
+    had SCHEDULED with "the run's pass budget is spent". Two reproductions, at both ends of
+    the feature: ``pdca flow 500 810 --max-passes 2``, with 500 splitting into 601 and 810
+    declaring ``Conflicts with: 601``, left **810 — an id the operator typed** — PLANNED and
+    exited 1; and a pure RECOVERY run, whose own drive set is empty, sized a pool off nothing
+    at all however many children the seed then handed over.
+
+    So it is read off the LIVE ``wave_list`` at each wave, which is the same thing as
+    recomputing it at every splice — a splice is the only thing that changes that list — and
+    the run's ceiling moves to somewhere it can be honoured: each wave gets the allowance the
+    operator set, no wave gets two (:func:`_drive_wave`'s own cap), and nothing gives back
+    what the run has already spent. What stops a chain of splits is that ADOPTION is bounded
+    — a bundle is adopted once, a candidate examined once, the disk is finite
+    (:func:`_adopt_split_children`) — not an arithmetic that starves whatever the schedule
+    grew past.
+    """
+    return allowance * len(wave_list)
 
 
 def _drive_wave(cfg: Config, wave: list[Path], *, by: str, today: str,
-                max_passes: int | None = None) -> None:
+                max_passes: int | None = None) -> int:
     """Drive ONE wave's bundles to all-terminal (COMPLETE / DISCONTINUED) with iteration,
     then the cheap-first sign-off restricted to the wave. Publishing and folding are the
     caller's. The pass loop mirrors the prior single-batch driver: build-all
-    (beat-synchronised, isolated), then a chunked sign-off whose decisions are recorded
-    (``apply_now=False``) so an iterate-do doesn't rebuild mid-review — looping until the
-    wave makes no progress (an iterate-plan re-open #105 still counts as progress) or every
-    bundle is terminal.
+    (beat-synchronised, isolated), then — before anything is offered a session — a
+    pre-apply of every pending bundle that already carries a decision from an earlier,
+    interrupted session (issue #453), then a chunked sign-off over the bundles still
+    undecided, whose decisions are recorded (``apply_now=False``) so an iterate-do doesn't
+    rebuild mid-review — looping until the wave makes no progress (an iterate-plan re-open
+    #105 still counts as progress) or every bundle is terminal.
 
     Neither non-terminal exit is silent (issue #260): a bundle still iterating when the
     budget runs out, or when a pass stops making progress, is named with a resume hint.
-    ``max_passes`` defaults to ``cfg.max_passes`` (``[driver].max_passes``)."""
+    ``max_passes`` is this wave's ALLOWANCE, and the count of passes actually consumed
+    comes back to the caller (#469) — so :func:`_drive_and_act` can draw every wave of a
+    run, including the ones split adoption adds, from ONE pool. Every exit reports it, and
+    the two UN-finished ones matter most: a wave that ran its allowance out, or one that
+    stopped making progress, is precisely the wave that spent the most, so reporting 0 there
+    would hand the next (possibly adopted) wave a budget the operator never allowed. Both
+    are pinned — ``test_a_wave_that_runs_its_allowance_out_still_charges_the_run_pool``,
+    ``test_a_wave_that_stalls_charges_the_run_pool_for_what_it_spent``. Defaults to
+    ``cfg.max_passes`` (``[driver].max_passes``)."""
     max_passes = cfg.max_passes if max_passes is None else max_passes
     names = {b.name for b in wave}
+    used = 0
     for _ in range(max_passes):
+        used += 1
         before = [state.state(d) for d in wave]
         _build_all(cfg, wave)
         # Before the human sees the queue, take the bundles whose findings are purely
@@ -587,9 +1802,26 @@ def _drive_wave(cfg: Config, wave: list[Path], *, by: str, today: str,
                 # Genuinely stuck (all terminal / planner declined an UNPLANNED) — but an
                 # ITERATE_* bundle here is progress the driver can no longer make.
                 _warn_abandoned(wave, why="a full pass made no progress")
-                return
+                return used
             continue    # progress (e.g. an iterate-plan re-open) — give it another pass
-        for chunk in _chunks(pending, SIGNOFF_BATCH_SIZE):
+        # Read before asking (issue #453). A pending bundle may already carry a decision from
+        # an earlier session whose run died before the driver applied it (a `^C`, which
+        # `_isolate` deliberately does not contain) — durable, un-consumed input, not a
+        # by-product of that session. Record + transition it HERE, isolated and deferred
+        # exactly like the post-session apply below, so the queue never re-presents a bundle
+        # the human already judged and no session overwrites their decision. Only two
+        # outcomes still owe a session: nothing was recorded, and an `accept` C6 refused (§6
+        # NEEDS-HUMAN still open, so that human really must come back). A pre-apply that
+        # RAISED is `_isolate`'s None — loudly skipped for this pass, like any other
+        # per-bundle step that fails, rather than handed a session over an unread decision.
+        needing_session: list[Path] = []
+        for d in pending:
+            applied = _isolate(d, "applying the recorded sign-off decision",
+                               lambda d=d: _apply_recorded_decision(
+                                   cfg, d, by=by, today=today, apply_now=False))
+            if applied in (UNDECIDED, "blocked"):
+                needing_session.append(d)
+        for chunk in _chunks(needing_session, SIGNOFF_BATCH_SIZE):
             try:
                 leaves.run_signoff_batch(cfg, chunk)
             except Exception as exc:  # noqa: BLE001 — a dropped session is not fatal
@@ -600,11 +1832,179 @@ def _drive_wave(cfg: Config, wave: list[Path], *, by: str, today: str,
                 _isolate(d, "sign-off", lambda d=d: _apply_decision(
                     cfg, d, by=by, today=today, apply_now=False))
         if all(state.state(d) in _TERMINAL for d in wave):
-            return
+            return used
     # Budget spent with work still in flight. An `iterate-do` recorded on the last allowed
-    # pass defers its rebuild to "the next pass's build-all" — which never comes.
-    _warn_abandoned(wave, why=f"pass budget exhausted after {max_passes} pass(es); raise "
+    # pass defers its rebuild to "the next pass's build-all" — which never comes. The
+    # allowance is named as THIS WAVE's (#469): once a run adopts, a later wave gets what is
+    # left of the run's pool, and "exhausted after 1 pass(es); raise [driver].max_passes"
+    # while that setting reads 20 is a contradiction to the operator it is addressed to.
+    _warn_abandoned(wave, why=f"pass budget exhausted after {max_passes} pass(es) — this "
+                             f"wave's allowance out of the run's pool; raise "
                              f"[driver].max_passes / PDCA_MAX_PASSES / --max-passes")
+    return used
+
+
+def _split_marked(d: Path) -> bool:
+    """True iff ``d`` carries the ``close-disposition = split`` breadcrumb, REGARDLESS of
+    whether ``state.state(d)`` has caught up to a terminal value (#566) — unlike
+    :func:`_is_split_parent`, which :func:`_adopt_split_children` and
+    :func:`_terminal_hint` both gate on confirmed-terminal ON PURPOSE, because DRIVING a
+    child before the human has confirmed the decomposition at sign-off would spend cycles
+    on work the next sign-off might reopen.
+
+    This predicate schedules and drives nothing, so that guard does not apply to it: a
+    parent split from another shell, while a live run still holds it un-terminal
+    (:func:`_warn_abandoned` — nothing left in THIS run will ever drive that parent's own
+    close-disposition through to a sign-off, since only the run that holds it could, and it
+    has already moved on), never becomes confirmed-terminal this run at all. Its children
+    are materialised on disk the moment :func:`split.accept` returns, well before any
+    confirmation — an orphaned, undriven bundle is exactly what this reports, so it must
+    not wait on a confirmation nothing in this run will ever produce.
+    """
+    try:
+        return (d / state.CLOSE_MARKER).read_text(
+            encoding="utf-8").strip() == SPLIT_DISPOSITION
+    except Exception:  # noqa: BLE001 — a marker that cannot be read is not a split here
+        return False
+
+
+def _warn_stranded_split_children(cfg: Config, bundles: list[Path],
+                                  adopt_seeds: list[Path] | None) -> None:
+    """The end-of-run half of the "never silent" invariant for a split (#566):
+    :func:`_adopt_split_children` only ever examines a bundle in the wave it was driven or
+    recovered in (``k=k`` at ``flow.py:1626-1627``, ``k=-1`` at ``flow.py:1546-1548``), so a
+    parent that reaches ``close-disposition = split`` AFTER its own examination has already
+    run — accepted from another shell while this run has already walked away from it
+    un-terminal (:func:`_warn_abandoned`), or moved on to drive a later, unrelated wave —
+    is never re-examined, and its children would otherwise sit PLANNED with nothing on this
+    run's stderr naming them.
+
+    Read-only: it claims nothing and schedules nothing. It walks through a child that is
+    itself split (:func:`_split_marked`) exactly as :func:`_adopt_split_children`'s own
+    queue walks through one already terminal on a split of its own
+    (``flow.py:1264-1271``), through the same lineage reader (:func:`_lineage_children`) —
+    so a chain abandoned part-way down is named all the way, not just at its first
+    generation.
+
+    Named only if it is IN FLIGHT: a child already terminal (``_TERMINAL`` — COMPLETE,
+    DISCONTINUED, RESOLVED) is finished work, not work this run stranded, so it is skipped
+    exactly as :func:`_adoptable` skips it ("already terminal", ``flow.py:1064-1076``).
+    Without that test the report named a decomposition an earlier run had already carried
+    all the way to COMPLETE as "left in-flight", handing the operator a ``pdca flow`` over
+    work that is done — the opposite of the invariant, which is about children NOTHING will
+    drive. The two tests are in :func:`_adoptable`'s order and for its reason: split FIRST,
+    terminal second, because a split parent is terminal BY DESIGN once its decomposition is
+    confirmed, and a terminal-first skip would stop the walk at exactly the generation whose
+    own children this exists to reach.
+
+    Examined over the run's FINAL drive set (``bundles``, after every splice) plus its
+    adoption seeds (a seed is never added to ``bundles`` — it is terminal, so this run never
+    drives it, only whatever of its children could be adopted): between them these are
+    every bundle the run's own accounting calls its own, so nothing already reflected in
+    ``bundles`` is named twice.
+    """
+    driven = {d.name for d in bundles}
+    candidates: list[Path] = list(bundles)
+    for seed in adopt_seeds or []:
+        if seed.name not in driven and all(seed.name != c.name for c in candidates):
+            candidates.append(seed)
+    reported: set[str] = set()
+    for parent in candidates:
+        if parent.name in reported or not _split_marked(parent):
+            continue
+        reported.add(parent.name)
+        stranded: list[str] = []
+        to_examine = [parent]
+        examined = {parent.name}
+        while to_examine:
+            p = to_examine.pop(0)
+            record = split.read_lineage(p) or {}
+            for cid in _lineage_children(record):
+                if not _PLAIN_ID.fullmatch(cid):
+                    continue
+                cd = cfg.bundle(cid)
+                if cd.name in examined:
+                    continue
+                real = _real(cd)
+                if real is None or not _inside_bundle_root(cfg, cd) or not cd.exists():
+                    continue
+                examined.add(cd.name)
+                if cd.name in driven:
+                    continue
+                if _split_marked(cd):
+                    # Walked through, not named: it has nothing of its own to build — but
+                    # ITS children, an earlier run may have stranded, still might be
+                    # (#473's own recovery walk, mirrored). Tested BEFORE the terminal skip
+                    # below, since a confirmed split parent IS terminal and skipping it
+                    # there would cut the walk off above its own children.
+                    to_examine.append(cd)
+                    continue
+                if state.state(cd) in _TERMINAL:
+                    # Finished, not stranded (`_adoptable`'s "already terminal",
+                    # `flow.py:1064-1076`): naming it would point `pdca flow` at work that
+                    # is already done.
+                    continue
+                stranded.append(cid)
+        if stranded:
+            # "did not drive ALL of its children", not "its children were not driven": the
+            # list is now the in-flight ones only, so the old preamble asserted something
+            # untrue about the finished siblings it no longer names.
+            print(f"flow: {parent.name} split; this run did not drive all of its children "
+                  f"— {', '.join(stranded)} left in-flight; drive them with `pdca flow "
+                  f"{' '.join(stranded)}`", file=sys.stderr)
+
+
+def _offered_by_seeds(cfg: Config, seeds: list[Path]) -> frozenset[str]:
+    """The bundle names the adoption seeds will OFFER this run (#590) — read silently.
+
+    The strict levelling of the named batch runs before the ``k=-1`` seed splice, so a
+    named id with ``Depends on`` a seed's child was refused as "neither in this batch nor
+    COMPLETE" one statement before that child would have been scheduled ahead of it. The
+    child IS part of the request — the operator named its parent as a recovery seed — so
+    :func:`waves.check_dep_graph` takes these names as resolvable.
+
+    "Offered" is: a lineage child, reached transitively through children that are
+    themselves terminal on a split (:func:`_is_split_parent`, the walk-through
+    :func:`_adoptable` hands back), whose bundle has a brief and is not terminal. A child
+    already COMPLETE resolves on its own; one DISCONTINUED / RESOLVED, or with no brief, is
+    not offered, so an edge to it still refuses up front. Same reader as adoption
+    (:func:`split.read_lineage` + :func:`_lineage_children`) and the same id / containment
+    guards, but NOTHING is printed or recorded: :func:`_adoptable` reports every skip, and
+    the adoption pass that follows still reports them, once. A child offered here that
+    adoption then does not take (another run holds it, …) is held at the re-level or
+    skipped by :func:`_runnable` at its dependent's wave — never a raise.
+
+    Never raises: a seed whose read fails contributes nothing, which leaves today's strict
+    answer for any edge into it.
+    """
+    offered: set[str] = set()
+    to_examine = list(seeds)
+    examined: set[str] = set()
+    while to_examine:
+        parent = to_examine.pop(0)
+        if parent.name in examined:
+            continue
+        examined.add(parent.name)
+        try:
+            if not _is_split_parent(parent):
+                continue
+            for cid in _lineage_children(split.read_lineage(parent) or {}):
+                if not _PLAIN_ID.fullmatch(cid):
+                    continue
+                d = cfg.bundle(cid)
+                if not _inside_bundle_root(cfg, d):
+                    continue
+                s = state.state(d)
+                if s in _TERMINAL:
+                    if _is_split_parent(d):
+                        to_examine.append(d)   # walked through, not offered (#473)
+                    continue
+                if s == state.UNPLANNED or not (d / "brief.md").exists():
+                    continue
+                offered.add(d.name)
+        except Exception:  # noqa: BLE001 — quiet by contract; the strict check stands
+            continue
+    return frozenset(offered)
 
 
 def _drive_and_act(
@@ -616,8 +2016,11 @@ def _drive_and_act(
     by: str,
     today: str,
     max_passes: int | None = None,
+    adopt_seeds: list[Path] | None = None,
+    claims: drive_claim.Run | None = None,
+    batch: Collection[str] | None = None,
 ) -> dict[str, str]:
-    """Drive a fixed set of in-flight bundles through the full cycle to Act, in waves.
+    """Drive a set of in-flight bundles through the full cycle to Act, in waves.
 
     The shared body of both batch entry points. :func:`waves.compute_waves` orders the
     batch into dependency waves (rejecting a cycle / unresolved dep up front); each wave is
@@ -627,20 +2030,161 @@ def _drive_and_act(
     prerequisite's accepted result within one run, as a reviewable PR stack the human
     merges (the harness never merges). Act runs **once** across the batch at the end.
 
+    The drive set is no longer frozen (#469): a bundle that reaches
+    ``close-disposition = split`` while this run is driving it hands its children back to
+    the run, spliced into the waves after its own (:func:`_adopt_split_children`).
+    ``adopt_seeds`` extends that to bundles the caller is NOT driving but wants examined for
+    stranded children (#473) — an id the operator named whose bundle was ALREADY terminal on
+    a split when the run started, which is how a run that stopped before its children were
+    driven is recovered. They are spliced by the same call at ``k=-1``, so recovery is one
+    more use of the adoption path rather than a second mechanism beside it.
+
+    ``max_passes`` (``[driver].max_passes``) keeps its meaning — the allowance ONE wave gets
+    — and sizes the run's **pool** at one allowance per wave the schedule holds, read LIVE so
+    that a splice which grows it re-sizes it (:func:`_pass_pool`, #473). So a wave the run
+    acquired mid-flight is funded like any other, and no bundle the run has SCHEDULED — an
+    adopted child, or an id the operator typed that a splice pushed further back — is
+    abandoned to arithmetic done before that wave existed. What bounds a chain of splits is
+    that adoption itself is bounded; ``spent`` is never reset, and a wave still gets no more
+    than one allowance. Running the pool out stops the run and names what it walked away
+    from (#260's discipline).
+
     ``--no-publish`` (``do_publish=False``) drives every wave to COMPLETE but sequences
     nothing — no publish, no fold — so a later wave builds on the unchanged base.
+
+    ``claims`` is the CLI run's claim scope (#565). The caller has already claimed
+    ``bundles``; adoption claims each child as it takes it on and skips one this run may not
+    drive (:func:`_adopt_split_children`). An adoption SEED is let go once the pre-pass over
+    it has run: it is terminal, so this run never drives it — only its children, which the
+    pre-pass has claimed in their own right. ``None`` — a library call — claims nothing.
+
+    ``batch`` (#591) is the bundles the run was ASKED to drive — ``flow_ids``' id list as
+    given (ids it skips as terminal or briefless included), ``flow_batch``'s sweep as taken
+    at run start. It scopes the run's integration branches (:func:`integrate.fold`), so a
+    concurrent run on the same base that drives a different batch never folds onto — and
+    never replaces — this run's line, while the same batch re-issued (its finished bundles
+    now skipped) lands on the same line. Before wave 0 such a re-issued run puts those
+    finished bundles on that line when a bundle it drives depends on one, or holds that
+    bundle, loudly (:func:`_carry_finished`, #646). ``None`` — a library call — scopes by
+    the drive set as passed.
     """
-    wave_list = waves.compute_waves(cfg, bundles)  # validates (raises) + levels the batch
-    last = len(wave_list) - 1
+    bundles = list(bundles)          # the drive set — split adoption extends it (#469)
+    allowance = cfg.max_passes if max_passes is None else max_passes
+    spent = 0                        # passes this RUN has consumed, across every wave
     batch_names = {b.name for b in bundles}  # in-batch prereqs ride the fold; #186 gates the rest
+    # The ids this run SET OUT to drive, frozen (#469). The drive set grows and shrinks with
+    # adoption; this does not — it is what separates "an id the operator named", which is
+    # answered for even when held, from "a child this run adopted", which is dropped again
+    # if a later reschedule holds it (:func:`_adopt_split_children`).
+    named = frozenset(batch_names)
+    # What scopes this run's integration line (#591): the request, frozen before adoption
+    # grows the drive set, so every fold of the run lands on one batch-scoped branch.
+    run_batch = sorted(batch) if batch is not None else sorted(named)
     published: set[str] = set()
+    # Bundles whose publish pushed their branch THIS run (`_publish_bundle` True, #593). An
+    # iterate keeps an earlier attempt's publish.json, so a record on disk cannot tell.
+    pushed: set[str] = set()
+    # Accepted bundles the fold has no branch of to carry (#593): left out of every fold,
+    # their in-batch dependents held by `_runnable`, instead of stopping the run.
+    held_unpushed: set[str] = set()
     accepted: list[Path] = []        # cumulative COMPLETE bundles, wave then name order
     integ: dict[tuple[str, str], str] = {}  # per-target (repo, base) → integration branch (#187)
+    # Per-target (repo, base) → the tip this run's last fold pushed (None in a dry-run), so
+    # each later fold continues THIS run's line, append-only (`integrate.fold`, #593).
+    folded_tips: dict[tuple[str, str], str | None] = {}
     preflighted = False              # per-lane preflight runs at most once, before the first pool
+    # The batch the caller NAMED is levelled first and strictly, exactly as before —
+    # `compute_waves` raises on a cycle or an unresolvable dependency. That contract belongs
+    # to the request (`waves.partition_schedulable`'s own docstring, waves.py:243-246, calls
+    # raising "right for an explicit `flow <ids>`"), and adoption never relaxes it.
+    #
+    # It is not a promise about the RE-levelling, and the difference is worth stating
+    # plainly (PR review): a splice re-waves `remaining + children` through the tolerant
+    # path, and `remaining` is the un-driven tail of the operator's own id list. So a named
+    # id whose prerequisite this run left un-terminal is HELD and reported there, where an
+    # un-spliced run would have reached its wave and let `_runnable` skip it. Same end state
+    # — PLANNED, in the results map, the run fails — one different line, and never a raise
+    # mid-run (`_reschedule`). Pinned by
+    # `test_a_named_id_in_the_re_scheduled_tail_is_held_not_lost`. An ADOPTED child held by
+    # that same re-levelling goes the other way — out of the drive set again, so it is not
+    # reported as this run's work (`_adopt_split_children`, `named` above).
+    #
+    # The request is the named ids AND what their recovery seeds offer (#590): an edge to a
+    # seed's in-flight child is resolvable here, adds no edge, and is ordered by the `k=-1`
+    # splice below, which re-levels with the child in place. Anything else still refuses.
+    offered = _offered_by_seeds(cfg, list(adopt_seeds)) if adopt_seeds else frozenset()
+    # validates (raises) + levels the batch
+    wave_list = waves.compute_waves(cfg, bundles, offered=offered)
+    # Recovery (#473): a seed is an id the operator named whose bundle was ALREADY terminal
+    # on a split, so an earlier run's children may still be sitting where it left them.
+    # `k=-1` makes `wave_list[k+1:]` the WHOLE schedule — the children are levelled in front
+    # of everything else, by the same splice, the same guards and the same report a mid-run
+    # split gets. With no seeds this is not even entered and the waves above stand.
+    if adopt_seeds:
+        _adopt_split_children(cfg, list(adopt_seeds), k=-1, wave_list=wave_list,
+                              bundles=bundles, batch_names=batch_names, named=named,
+                              claims=claims)
+        # The seed itself is terminal — nothing here drives it — and this is the ONE point
+        # at which this run reads it. Held until now so no second run could split or
+        # re-parent it half-way through the read; let go the moment the read is done, so
+        # the operator's own `pdca flow <parent>` recovery is not refused by this run
+        # while it drives the children it just took (#565).
+        if claims is not None:
+            for d in adopt_seeds:
+                claims.release(d)
+        if not bundles:
+            # A recovery run whose seeds offered nothing adoptable (the brood was already
+            # driven, or every child was refused and named above). There is no schedule, so
+            # there is nothing to drive, sweep, publish or Act on — the quiet no-op naming a
+            # finished bundle has always been. The seeds' own dispositions are `flow_ids`'
+            # `skipped` map, which is what the caller reports.
+            return {}
+    # A re-issued run's finished named ids (#646): carried onto the line before wave 0 when
+    # clean, else named in `held_finished`, which holds only their plain `Depends on`
+    # dependents. Only where a fold would run: stack mode, publishing on.
+    held_finished: set[str] = set()
+    if do_publish and cfg.wave_mode != "merge":
+        _carry_finished(cfg, bundles, _finished_named(cfg, batch, batch_names),
+                        batch=run_batch, integ=integ, folded_tips=folded_tips,
+                        held=held_finished)
+    # `wave_list` is iterated by a LIST iterator on purpose (#469): adoption splices the
+    # recomputed remainder into `wave_list[k+1:]` after wave k drives, and the iterator —
+    # which simply indexes forward — picks the new tail up. So "how many waves are left" is
+    # read live below (never cached in a `last`), and an adopted child's wave is driven,
+    # published and folded by exactly the code every other wave goes through.
+    # A plain `Depends on` prerequisite the run was not asked for is on no line of this run,
+    # so its dependent waits for its merge into the dependent's base (#647). Only where a
+    # fold would run (stack mode, publishing on), and not in a dry-run, which asks no host
+    # and holds nothing. The ids asked for are normalised as `_finished_named` does.
+    hold_unmerged = (do_publish and cfg.wave_mode != "merge"
+                     and cfg.publisher.mode != "stub")
+    requested = set(named) | {cfg.bundle(str(i).removeprefix("issue_")).name
+                              for i in (batch or ())}
     for k, wave in enumerate(wave_list):
-        runnable = _runnable(cfg, wave, batch_names)
+        runnable = _runnable(cfg, wave, batch_names, held=held_unpushed | held_finished,
+                             requested=requested, hold_unmerged=hold_unmerged)
         if not runnable:
             continue
+        # The pool, read off the schedule as it stands NOW — so a splice below has already
+        # re-sized it by the time the wave it created asks to open (#473).
+        budget = _pass_pool(allowance, wave_list)
+        if spent >= budget:
+            # No wave opens on budget the pool does not hold (#469) — the pool's ADMISSION
+            # rule, which is not the same statement as the arithmetic that feeds it. Since
+            # #473 the pool covers the LIVE schedule, so a run whose waves each spend
+            # ≤ `allowance` no longer reaches this, and that is the point: the wave adoption
+            # added is funded instead of abandoned. The rule stays because it still has to
+            # hold when the arithmetic does not — a wave that came to spend more than it was
+            # handed must stop the run here rather than overspend silently. The one input
+            # that still reaches it is an allowance of 0, which no operator can type
+            # (`config.py` clamps `[driver].max_passes` / `PDCA_MAX_PASSES`, `cli.py:572`
+            # clamps `--max-passes`) but a `Config` built in-process can hold.
+            # Never silent (#260): everything still in flight is named with a hint.
+            _warn_abandoned([d for w in wave_list[k:] for d in w],
+                            why=f"the run's pass budget is spent ({budget} pass(es) over "
+                                f"{k} wave(s)); raise [driver].max_passes / "
+                                f"PDCA_MAX_PASSES / --max-passes")
+            break
         # Per-lane resource preflight (issue #213): the FIRST wave that will actually pool —
         # lanes>1 AND >1 *runnable* bundle (a wave _runnable filters down to one bundle, e.g.
         # one blocked on an unmerged out-of-batch prereq, takes the serial path and sets no
@@ -658,11 +2202,25 @@ def _drive_and_act(
                     f"lane preflight failed for a lanes={cfg.lanes} batch — not fanning out "
                     "(fix the per-lane resources above, then re-run)")
         # Reconcile each runnable bundle's stack base with this run's integration state:
-        # point it at its OWN (repo, base) target's branch, or clear a stale marker a
-        # prior/resumed run left so it builds off its own base (#187). Unconditional — the
-        # stale-clear must run even before any wave has folded (integ still empty).
-        _point_at_integration(integ, runnable)
-        _drive_wave(cfg, runnable, by=by, today=today, max_passes=max_passes)
+        # point it at its OWN (repo, base) target's branch, and the line commit it builds on
+        # (#593), or clear a stale marker a prior/resumed run left so it builds off its own
+        # base (#187). Unconditional — the stale-clear must run even before any wave has
+        # folded (integ still empty).
+        _point_at_integration(integ, runnable, folded_tips)
+        # This wave's allowance is its own cap AND what is left of the run's pool, whichever
+        # is smaller — the second term is the admission rule again, applied to the wave that
+        # was let in (#469); with the pool covering the live schedule (#473) it can only bite
+        # if a wave came to spend more than it was handed.
+        spent += _drive_wave(cfg, runnable, by=by, today=today,
+                             max_passes=min(allowance, budget - spent))
+        # A bundle that SPLIT during this wave hands its children back to the run that
+        # caused the split (#469), spliced into the waves AFTER this one — instead of
+        # ending with the parent terminal, the children PLANNED, and the operator
+        # restarting by hand with `pdca flow <child-ids>`. The waves it adds are funded by
+        # the `_pass_pool` read at the top of the NEXT iteration (#473); `spent` is untouched
+        # here and never anywhere else — a bound, not a reset.
+        _adopt_split_children(cfg, runnable, k=k, wave_list=wave_list, bundles=bundles,
+                              batch_names=batch_names, named=named, claims=claims)
         complete = [d for d in sorted(runnable, key=lambda p: p.name)
                     if state.state(d) == state.COMPLETE]
         _audit_wave_overlap(complete)
@@ -696,7 +2254,8 @@ def _drive_and_act(
                     # Mechanics-only: the pre-pass drafted AND T4-gated the texts — a
                     # second T4 run here could transiently fail AFTER siblings pushed,
                     # recreating the half-published wave (#295 review).
-                    _publish_bundle(cfg, d, by=by, today=today, texts_prevalidated=True)
+                    if _publish_bundle(cfg, d, by=by, today=today, texts_prevalidated=True):
+                        pushed.add(d.name)   # its branch is this run's to fold (#593)
                 else:
                     print(f"flow: {d.name} — publish texts not ready (draft/T4 failed); "
                           f"NOT published this run; fix and run `pdca publish "
@@ -708,7 +2267,7 @@ def _drive_and_act(
         # branch the next wave builds on (fork-safe, no merge). Opt-in "merge": gh-merge the
         # wave's PRs so the next wave builds on the genuinely-merged base. Dry-run (stubbed
         # publisher: offline rehearse / CI) prints the plan and changes nothing.
-        if k < last and do_publish:
+        if k < len(wave_list) - 1 and do_publish:
             dry = cfg.publisher.mode == "stub"
             if cfg.wave_mode == "merge":
                 if merge.merge_wave(cfg, complete, dry_run=dry, method=cfg.merge_method):
@@ -716,36 +2275,42 @@ def _drive_and_act(
                           file=sys.stderr)
                     break
             else:  # default: stack — fold onto a per-target integration branch
-                # ONE lock scope covers fold AND re-gate (#297 review round 10): the
-                # locks stack keeps every target's integ lock held between the two,
-                # so no gap exists in which another flow's publish-boundary sweep
-                # could remove the tree — or another fold rewrite it — before the
-                # re-gate attests it.
-                stop_wave = False
-                with contextlib.ExitStack() as locks:
-                    try:
-                        folded = integrate.fold(cfg, accepted, dry_run=dry, locks=locks)
-                    except integrate.IntegrationError as exc:
-                        print(f"flow: wave {k} did not integrate ({exc}); STOPPING — "
-                              f"later waves not run.", file=sys.stderr)
-                        break
-                    if folded and not dry:
-                        integ = {tgt: branch for tgt, (branch, _wt) in folded.items()}
-                        # Optional re-gate (#wave-model): validate EACH folded
-                        # combination over its integration tip before the next wave
-                        # builds on it; any red ⇒ STOP. hold_lock=False: the locks
-                        # stack already holds this tree's lock (re-acquiring would
-                        # deadlock on our own flock).
-                        if cfg.regate_between_waves and any(
-                                wt is not None
-                                and gates.run_integration(cfg, wt, hold_lock=False)
-                                        .get("overall") == "fail"
-                                for _tgt, (_branch, wt) in folded.items()):
-                            print(f"flow: wave {k} integration re-gate FAILED — a "
-                                  f"combination is red though each fix was green alone; "
-                                  f"STOPPING (later waves not run).", file=sys.stderr)
-                            stop_wave = True
-                if stop_wave:
+                # An accepted, patched, targeted bundle whose branch was not pushed this run
+                # (texts failed draft/T4, or publish failed before or at its push — an
+                # earlier attempt's publish.json may still name the old, rejected branch)
+                # leaves the fold nothing to carry (#593). Hold it, and via `_runnable` its
+                # dependents, rather than stop the run. A branch pushed this run is folded
+                # even if `gh pr create` failed after it. Not in a dry-run: the stub pushes
+                # nothing and records no branch.
+                if not dry:
+                    for d in integrate.unpublished(accepted, pushed=pushed):
+                        if d.name not in held_unpushed:
+                            held_unpushed.add(d.name)
+                            print(f"flow: {d.name} pushed no branch this run — left out "
+                                  f"of the integration fold; bundles that depend on it are "
+                                  f"held this run.", file=sys.stderr)
+                # ONE lock scope covers fold, tip read AND re-gate (#297 review round 10),
+                # shared with the pre-wave carry (`_fold_lines`, #646).
+                try:
+                    folded, tips, red = _fold_lines(
+                        cfg, [d for d in accepted if d.name not in held_unpushed], dry=dry,
+                        folded_this_run=dict(folded_tips), batch=run_batch)
+                except integrate.IntegrationError as exc:
+                    print(f"flow: wave {k} did not integrate ({exc}); STOPPING — "
+                          f"later waves not run.", file=sys.stderr)
+                    break
+                # The next fold continues from exactly each pushed tip and refuses a line
+                # another run moved (#593). A dry-run pushes nothing (None).
+                folded_tips.update(tips)
+                if folded and not dry:
+                    # Update, not replace: a target only the carry folded keeps its line.
+                    integ.update({tgt: branch for tgt, (branch, _wt) in folded.items()})
+                # Optional re-gate (#wave-model): EACH folded combination is validated over
+                # its integration tip before the next wave builds on it; any red ⇒ STOP.
+                if red:
+                    print(f"flow: wave {k} integration re-gate FAILED — a "
+                          f"combination is red though each fix was green alone; "
+                          f"STOPPING (later waves not run).", file=sys.stderr)
                     break
 
     _sweep_quietly(cfg, bundles)  # publish/freeze boundary — reclaim footprint (#297)
@@ -753,6 +2318,11 @@ def _drive_and_act(
     if do_act:
         _maybe_run_act(cfg, today,
                        any_complete=any(s == state.COMPLETE for s in results.values()))
+    # Never silent about a split children this run never reached (#566) — the end-of-run
+    # half of the invariant `cli._split`'s conditional line promises: every child a split
+    # produced is either driven by this run or named, with the command that drives it, by
+    # the time it ends.
+    _warn_stranded_split_children(cfg, bundles, adopt_seeds)
     return results
 
 
@@ -768,6 +2338,7 @@ def flow_batch(
     by: str = "",
     today: str | None = None,
     max_passes: int | None = None,
+    claims: drive_claim.Run | None = None,
 ) -> dict[str, str]:
     """Plan many → drive every in-flight bundle to sign-off → publish → Act once. **Resumable.**
 
@@ -777,38 +2348,103 @@ def flow_batch(
     "no new briefs". COMPLETE bundles (done), DISCONTINUED ones (abandoned) and UNPLANNED
     ones (no brief — e.g. an issue the planner chose to skip) are left alone. Returns
     ``{issue_id: state}``.
+
+    With ``claims`` (the CLI run's, #565) the sweep is the run's IMPLICIT reach, so it
+    excludes rather than refuses: an in-flight bundle this run may not drive — another live
+    run holds it, or its claim cannot be recorded — is named and left alone, and the rest of
+    the batch is driven. One the scheduler then holds is let go again at once, since this
+    run will not drive it. The Plan session itself runs BEFORE any of this, and is not
+    fenced: see :mod:`drive_claim`.
+
+    ``claims`` also holds :func:`drive_claim.sweep_marker` for the SPAN of this call (#566):
+    from here until every in-flight bundle has been claimed or excluded, so
+    ``cli._split``'s live-holder check can tell "a live CSV batch has not swept yet" — this
+    Plan session (above) can itself run a ``pdca split --accept`` on a bundle nothing has
+    claimed yet, since the sweep pulls in EVERY in-flight bundle, that includes whatever it
+    just split. Best-effort and never gates the batch: a marker this cannot record still
+    leaves the ordinary per-bundle claims to refuse or exclude correctly, exactly as before.
     """
     today = today or datetime.date.today().isoformat()
+    marker = drive_claim.sweep_marker(cfg) if claims is not None else None
+    if claims is not None:
+        claims.take(marker)   # best-effort (#566): informational only, see above.
+    try:
+        leaves.do_plan_batch(cfg, csv)
+        # Resume set: every bundle with a brief that isn't finished. UNPLANNED (skipped /
+        # un-briefed), COMPLETE (done), DISCONTINUED (deliberately abandoned) and RESOLVED
+        # (settled in the tracker, #302) are excluded, so a re-run is idempotent and a
+        # discontinued or resolved bundle stays out of the sweep.
+        bundles = sorted(
+            (cfg.bundle_root / name for name in _bundle_dirs(cfg)
+             if state.state(cfg.bundle_root / name)
+             not in (state.COMPLETE, state.UNPLANNED, state.DISCONTINUED, state.RESOLVED)),
+            key=lambda p: p.name,
+        )
+        # The batch identity (#591): the sweep as taken at run start, before the claim /
+        # `_admit` / scheduling trims below — it scopes this run's integration line. No
+        # resume stability: finished bundles leave the sweep, so a re-run gets a fresh line
+        # of its own — never another run's.
+        swept = [d.name for d in bundles]
+        if not bundles:
+            print("flow: nothing to do — no in-flight briefs (all COMPLETE or none authored; "
+                  "brief new issues to add work).", file=sys.stderr)
+            return {}
+        if claims is not None:
+            bundles = _claim_swept(claims, bundles)
+            if not bundles:
+                print("flow: nothing to drive — this run could not claim any in-flight "
+                      "bundle (each is named above).", file=sys.stderr)
+                return {}
+        # After the claim, never in the state filter above (#565): a briefless bundle past Do
+        # is given its brief or named and left out — never written while another run holds
+        # it, and never driven without one (#597).
+        bundles = [d for d in bundles if _admit(cfg, d, claims)]
+        if not bundles:
+            print("flow: nothing to drive — no in-flight bundle has a brief.md (each is "
+                  "named above).", file=sys.stderr)
+            return {}
+        # Resume tolerance (#191): the sweep pulls in EVERY in-flight bundle, so a stale /
+        # misconfigured `Depends on` in an unrelated leftover must not abort the whole run.
+        # Hold (skip this run, leave in-flight) any bundle with an unresolvable dependency or
+        # in a cycle — plus its in-batch dependents — and drive the schedulable remainder.
+        bundles, held = waves.partition_schedulable(cfg, bundles)
+        _report_held(held)  # one report shape, shared with split adoption (#469)
+        if claims is not None:
+            # Claimed to be driven, then held: this run will not drive them after all, and
+            # the line above has just told the operator to resolve it and re-run — which
+            # must not be refused by this run (#565). Let go at once, as adoption lets go of
+            # a child it drops, and BEFORE the "nothing schedulable" return below, which is
+            # the same decision taken over every swept bundle at once.
+            for name in held:
+                claims.release(cfg.bundle_root / name)
+        if not bundles:
+            print("flow: nothing schedulable — every in-flight bundle is held on an "
+                  "unresolved dependency or a cycle.", file=sys.stderr)
+            return {}
+        return _drive_and_act(cfg, bundles, do_publish=do_publish, do_act=do_act, by=by,
+                              today=today, max_passes=max_passes, claims=claims,
+                              batch=swept)
+    finally:
+        # The sweep is fully decided by every return above (and by a raise, which leaves
+        # nothing further for `cli._split` to promise about either) — released here so the
+        # marker's life is exactly "this batch has not yet finished deciding what it drives".
+        if claims is not None:
+            claims.release(marker)
 
-    leaves.do_plan_batch(cfg, csv)
-    # Resume set: every bundle with a brief that isn't finished. UNPLANNED (skipped /
-    # un-briefed), COMPLETE (done), DISCONTINUED (deliberately abandoned) and RESOLVED
-    # (settled in the tracker, #302) are excluded, so a re-run is idempotent and a
-    # discontinued or resolved bundle stays out of the sweep.
-    bundles = sorted(
-        (cfg.bundle_root / name for name in _bundle_dirs(cfg)
-         if state.state(cfg.bundle_root / name)
-         not in (state.COMPLETE, state.UNPLANNED, state.DISCONTINUED, state.RESOLVED)),
-        key=lambda p: p.name,
-    )
-    if not bundles:
-        print("flow: nothing to do — no in-flight briefs (all COMPLETE or none authored; "
-              "brief new issues to add work).", file=sys.stderr)
-        return {}
-    # Resume tolerance (#191): the sweep pulls in EVERY in-flight bundle, so a stale /
-    # misconfigured `Depends on` in an unrelated leftover must not abort the whole run. Hold
-    # (skip this run, leave in-flight) any bundle with an unresolvable dependency or in a
-    # cycle — plus its in-batch dependents — and drive the schedulable remainder.
-    bundles, held = waves.partition_schedulable(cfg, bundles)
-    for name, reason in sorted(held.items()):
-        print(f"flow: {name} held this run — {reason}; left in-flight (resolve it, then "
-              f"re-run).", file=sys.stderr)
-    if not bundles:
-        print("flow: nothing schedulable — every in-flight bundle is held on an unresolved "
-              "dependency or a cycle.", file=sys.stderr)
-        return {}
-    return _drive_and_act(cfg, bundles, do_publish=do_publish, do_act=do_act, by=by,
-                          today=today, max_passes=max_passes)
+
+def _claim_swept(claims: drive_claim.Run, bundles: list[Path]) -> list[Path]:
+    """The swept bundles this run could claim (#565); each one it may not drive is named
+    (:func:`_excluded`) and left alone. Claimed BEFORE the scheduler partitions the sweep,
+    so a bundle whose prerequisite another run is driving is held by the partition rather
+    than scheduled against a base that lacks it."""
+    out: list[Path] = []
+    for d in bundles:
+        why = claims.take(d)
+        if why is None:
+            out.append(d)
+        else:
+            _excluded(d, "NOT driven", why)
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -825,6 +2461,7 @@ def flow_ids(
     by: str = "",
     today: str | None = None,
     max_passes: int | None = None,
+    claims: drive_claim.Run | None = None,
 ) -> dict[str, str]:
     """Drive specific bundles by id through the FULL cycle to Act.
 
@@ -833,8 +2470,29 @@ def flow_ids(
     **Plan pre-pass** first briefs any UNPLANNED id in the list in ONE shared interactive
     session (``do_plan_batch`` over those ids, reading each bundle's ``notes.json``), making
     this the id-seeded analogue of ``flow_batch``. Ids still UNPLANNED after the pre-pass
-    (planner skipped them) and terminal ids (COMPLETE / DISCONTINUED) are left alone.
-    Returns ``{issue_id: state}``.
+    (planner skipped them) and terminal ids (COMPLETE / DISCONTINUED) are left alone —
+    except that an id terminal on a ``split`` is ALSO handed to :func:`_drive_and_act` as an
+    **adoption seed** (#473), so a run named after a parent whose children an earlier run
+    stranded drives those children instead of only re-printing the hint at them.
+
+    Returns ``{issue_id: state}`` for **every id it was given** (issue #468), driven or
+    skipped — a skipped id's disposition is its state on disk, the same value
+    ``_drive_and_act`` records for a bundle it DID drive. TOTAL, because this map is the
+    single authority both ``pdca flow <id>`` and ``pdca flow <id> <id>`` report and derive
+    their exit code from (``cli._flow``): a map that silently omitted the ids it skipped
+    would force each caller to fill the gaps itself, which is precisely how the two CLI
+    shapes came to disagree — the same DISCONTINUED bundle exited 1 alone and 0 next to a
+    completing sibling, because only one shape could see it. Unlike ``flow_batch``, whose
+    caller passes no id list and can therefore only be told what was driven, every id here
+    was ASKED FOR by name and so gets an answer.
+
+    ``claims`` is the CLI run's claim scope (#565), and the CLI has ALREADY claimed every id
+    in ``ids`` with it — before this function's first write, the revalidation below — or
+    refused the run (``cli._flow``). An id the filter below SKIPS is let go there: this run
+    will not drive it, so a run that names it next is not refused. The one exception is a
+    split parent handed on as an adoption SEED, which is held until its adoption pre-pass
+    has read it (:func:`_drive_and_act`). The rest reach adoption through
+    :func:`_drive_and_act`.
     """
     today = today or datetime.date.today().isoformat()
 
@@ -865,21 +2523,61 @@ def flow_ids(
             leaves.do_plan_batch(cfg, csv, ids=plan_targets)
 
     bundles: list[Path] = []
+    skipped: dict[str, str] = {}   # asked for, not driven — still gets a disposition (#468)
+    seeds: list[Path] = []       # terminal on a split — examined for stranded kids (#473)
     for iid in ids:
         d = cfg.bundle(iid)
         s = state.state(d)
         if not d.exists() or s == state.UNPLANNED:
             print(f"flow: {d.name} — no brief.md, skipped (brief it at Plan first)", file=sys.stderr)
+            skipped[iid] = s
+            if claims is not None:
+                claims.release(d)          # not driven by this run after all (#565)
             continue
         if s in _TERMINAL:
             print(f"flow: {d.name} — already terminal ({s}), skipped", file=sys.stderr)
+            hint = _terminal_hint(d, s)   # the ONE recovery advice, both CLI shapes (#468)
+            if hint:
+                print(f"  {hint}", file=sys.stderr)
+            skipped[iid] = s
+            seed = _is_split_parent(d)
+            if claims is not None and not seed:
+                # Nothing to drive here, and nothing left to read either — which is the one
+                # thing a SEED is still held for (its adoption pre-pass, released in
+                # `_drive_and_act`). Let this one go now, so the next run that names it is
+                # not refused by a run that has already finished with it (#565).
+                claims.release(d)
+            if seed:
+                # Terminal on a `split` is nothing to DRIVE — but its children may still be
+                # sitting PLANNED where the split left them, and naming the parent again is
+                # the operator's recovery (#473). Dropping the id HERE, with nothing else
+                # done about it, is precisely what stranded them; the run is handed the
+                # parent as an adoption seed instead. Its own disposition stays in
+                # `skipped`, so the results map both CLI shapes report still answers for
+                # every id it was given (#468), and each child gets its own line from the
+                # adoption report. The hint above still stands for whatever this run cannot
+                # adopt, which is why it is qualified rather than replaced.
+                print("  its children are examined for adoption into THIS run — that "
+                      "command is only needed for whatever cannot be adopted, which is "
+                      "named below.", file=sys.stderr)
+                seeds.append(d)
+            continue
+        if not _admit(cfg, d, claims):
+            # Past Do with no brief.md and none to rebuild (#597): named by `_admit`, and
+            # still answered for in the map (#468), so the run cannot exit 0 over it.
+            skipped[iid] = s
             continue
         bundles.append(d)
-    if not bundles:
-        return {}
+    if not bundles and not seeds:
+        return skipped
     bundles.sort(key=lambda p: p.name)
-    return _drive_and_act(cfg, bundles, do_publish=do_publish, do_act=do_act, by=by,
-                          today=today, max_passes=max_passes)
+    # The batch is the ids AS ASKED FOR (#591), skipped ones included, so a re-issued run
+    # whose finished bundles are now skipped still folds onto the same integration line
+    # (`integrate.batch_key` normalises `500` / `issue_500`, order and repeats).
+    return skipped | _drive_and_act(cfg, bundles, adopt_seeds=seeds, do_publish=do_publish,
+                                    do_act=do_act, by=by, today=today,
+                                    max_passes=max_passes, claims=claims,
+                                    batch=list(ids))
 
 
 def _bundle_dirs(cfg: Config) -> set[str]:
