@@ -12,7 +12,7 @@ authors = [{ name = "Eduard Ralph", email = "eduard@ralphovi.net" }]
 dependencies = []
 
 [project.scripts]
-pdca-autobook = "pdca_harness.cli:main"
+autobook-pdca = "pdca_harness.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

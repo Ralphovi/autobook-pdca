@@ -6,7 +6,7 @@ author_email: eduard@ralphovi.net
 author_name: Eduard Ralph
 builder_family: claude
 bundle_root: results
-cli_name: pdca-autobook
+cli_name: autobook-pdca
 contribution_model: own-repo
 default_branch: main
 gates_runner: ./engine/nox.sh
