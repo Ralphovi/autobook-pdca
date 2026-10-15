@@ -1108,7 +1108,7 @@ level = "WARN"
 group = "autobook applier (never a PDCA gate)"
 id = "python3-gnucash"
 cmd = "python3 -c 'from gnucash import SessionOpenMode'"
-hint = "sudo apt install python3-gnucash (GnuCash 5.x: SessionOpenMode) — needed only for the human-run book-process tests (`nox -s applier`); no PDCA gate can reach it (see engine/nox.sh). Pre-5.x bindings lack SessionOpenMode and must not be used"
+hint = "optional: host GnuCash 5.x bindings (SessionOpenMode) are needed only to open a restored copy of a real book by hand. Book-process tests run in ../autobook/testenv/ and need nothing installed here. Pre-5.x bindings lack SessionOpenMode and must not be used"
 level = "WARN"
 
 # ---------------------------------------------------------------------------
