@@ -461,6 +461,15 @@ path = "../autobook/docs/design/proposals/draft/*.md"
 type = "file"
 path = "../autobook/docs/design/architecture/0[5689]-*.md"
 
+# Autobook's repo policy, which every brief must respect: the pipeline/book-process
+# boundary, the synthetic-data rule, and where the tests run and how each place gets the
+# dependencies (autobook-pdca#12 — a brief that added a dependency missed the test
+# environment because the planner never saw that list). The reviewers already rate
+# against it through `rubric_file`; this gives the planner the same rules up front.
+[[plan.source]]
+type = "file"
+path = "../autobook/AGENTS.md"
+
 # Publish mechanics — `autobook-pdca publish` and the flow's publish-on-accept (docs 03 §Check
 # closing step). Branch patterns are `{id}` / `{slug}` format strings; the
 # repo→checkout map falls back to the sibling convention (`<project>/../<repo-last-
@@ -1303,6 +1312,14 @@ checks = [
   # instead of failing when the test can't even import without the fix, which is the
   # greenfield case. Applier tests are deselected, as in Autobook's own gate.
   { id = "C4-verify", tier = "C4", label = "fix verified: bundle test red pre-fix, green post-fix (pytest)", cmd = "./engine/scripts/run-verify.sh", gating = true, scope = "bundle" },
+
+  # The test environment can still import every test module (autobook-pdca#12). pytest
+  # imports them all before it filters by marker, so one module importing a package the
+  # `book` image lacks breaks every container run; C4-ci and C4-verify install dependencies
+  # on the host and never see it. Runs only when the patch changes pyproject.toml, a test
+  # module or testenv/: builds the lane's image and runs `pytest --collect-only` in it.
+  # Not the per-fix verifier, so no base ladder (verifies_base, pdca-harness#474).
+  { id = "C4-testenv-collect", tier = "C4", label = "test environment imports every test module (pytest --collect-only)", cmd = "./engine/scripts/check-testenv-collect.sh", gating = true, scope = "bundle", verifies_base = false },
 
   # T4 goes through scripts/pdca so it resolves this checkout's CLI whether or not .venv/bin
   # is on PATH (a bare console-script name is not). The template only renders this row for

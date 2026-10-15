@@ -48,6 +48,14 @@
   real red→green. Without Docker or `testenv/` they do not run and the bundle is
   unverifiable. Stacks stay up between cycles for speed; `docker compose ls` lists
   them and `docker compose -p autobook-pdca-l<lane> down -v` removes one.
+- **A patch that changes a dependency must not break the test environment.** pytest
+  imports every test module before it filters by marker, so a module that imports a
+  package the `book` image lacks breaks every container run, book tests or not. When
+  the patch changes `pyproject.toml`, a test module or `testenv/`, `C4-testenv-collect`
+  builds the lane's image from the worktree and runs `pytest --collect-only` in it
+  (autobook-pdca#12; Ralphovi/autobook#51 and #52 passed every gate and failed GitHub's
+  `testenv` workflow this way). Autobook's `AGENTS.md` lists the four places its tests
+  run and how each gets the dependencies; a brief that adds one says how it reaches each.
   **Real data never enters PDCA:** the backtest on the user's history, the D1/D2
   validation runs and anything that opens a real book stay human-run, outside the
   cycle (the `human-run` label marks the issues whose milestone closes on such a run).
@@ -110,7 +118,8 @@ For each tier: the **written ruleset** it consumes, its **home**, and the
 written source is auditable; one you can't is folklore.
 
 Gating policy (see `engine/README.md`): C4-ci (Autobook's own gate), C4-verify
-(red→green) and T4-contribution gate; the T2 threat-model touch check is advisory.
+(red→green), C4-testenv-collect (the test environment imports every test module) and
+T4-contribution gate; the T2 threat-model touch check is advisory.
 
 | Tier | Written ruleset | Home | Single-sourced command | Status |
 |---|---|---|---|---|
@@ -251,7 +260,7 @@ self-reported difficulty field. `security-review` grades the patch against
 | CLI resolver for gate rows | `scripts/pdca` | `./scripts/pdca contribcheck` | [built] |
 | Driver | `src/pdca_harness/` | `autobook-pdca run <id>` | [built — live leaves] |
 | Act tooling (L4) | `src/pdca_harness/act.py` | `autobook-pdca act index`, `autobook-pdca act log --date <d>` | [built] |
-| Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `autobook-pdca gates [<id>] [--working-tree]` | [built — C4-ci, C4-verify, T4, T2] |
+| Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `autobook-pdca gates [<id>] [--working-tree]` | [built — C4-ci, C4-verify, C4-testenv-collect, T4, T2] |
 | Reviewer role prompt | `agents/reviewer.md` (canonical body; inlined for codex) | (model leaf) | [built — command mode] |
 | Security-review role prompt | `agents/security-review.md`; `.claude/agents/security-review.md` | (advisory leaf) | [built — always on] |
 | Builder role prompt | `agents/builder.md`; `.claude/agents/builder.md` + `.claude/hooks/builder_guard.py` | (model leaf) | [built — ready-mark blocked] |

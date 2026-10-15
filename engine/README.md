@@ -6,6 +6,7 @@
 |---|---|---|---|
 | C4-ci | `nox.sh gate` | yes | Autobook's whole gate (fmt, lint, types, pytest, typos, docs lint) on the patched worktree. Repo-scoped; reports unverifiable in CI, where there is no Autobook checkout |
 | C4-verify | `scripts/run-verify.sh` | yes | The bundle's test is red with the production hunks reverted and green with them, judged by pytest's exit code **and** the tests that actually ran (`scripts/lib/junit_count.py`, from JUnit XML). Applier tests are deselected |
+| C4-testenv-collect | `scripts/check-testenv-collect.sh` | yes | When the patch changes `pyproject.toml`, a test module or `testenv/`: the lane's test-environment image builds from the worktree and `pytest --collect-only` imports every test module in it. No Docker or no `testenv/` is unverifiable |
 | T4 | `../scripts/pdca contribcheck` | yes | Commit message and PR description shape |
 | T2 | `scripts/check-threat-model-touch.sh` | no | A patch touching security-relevant paths also updates `../autobook/.oss-scanner/threat_model.md`; otherwise §6 |
 
