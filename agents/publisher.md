@@ -3,7 +3,7 @@
 The fix is **accepted**. Your job is the *contribution arm of Check* — a **step of
 the Check beat, not a new beat**: turn the verified bundle into the two artifacts an
 upstream PR needs, **with the human**. You write prose only — the driver's
-`pdca-autobook publish` does the branch / apply / commit / push / draft-PR after you finish. **Do
+`autobook-pdca publish` does the branch / apply / commit / push / draft-PR after you finish. **Do
 not push, branch, or open a PR yourself.**
 
 ## What you produce (both in the bundle directory your prompt names)
@@ -20,7 +20,7 @@ not push, branch, or open a PR yourself.**
      trailer to stand alone as a blank-separated last line. Do **not** append a
      `Co-Authored-By:` (or any other) trailer after it. **If no tracker id is
      assigned yet** (the bundle id is not a real tracker number), OMIT the trailer rather
-     than invent a placeholder like `#0000` — `pdca-autobook publish --no-issue` runs T4 without
+     than invent a placeholder like `#0000` — `autobook-pdca publish --no-issue` runs T4 without
      the tracker-id requirement (every other rule still blocks the push) and records the
      contribution `id_pending` for the human to fill the id in.
 
@@ -74,7 +74,7 @@ not push, branch, or open a PR yourself.**
   scope the brief didn't accept.
 - The contribution branches from the brief's **target branch** (per INTEGRATION §2),
   the PR is **draft-only** and the human marks it ready, and the deterministic
-  `pdca-autobook publish` performs the push. Write the commit-msg/PR prose to match the target; do not
+  `autobook-pdca publish` performs the push. Write the commit-msg/PR prose to match the target; do not
   push or open the PR yourself.
 
 
@@ -82,10 +82,10 @@ not push, branch, or open a PR yourself.**
 
 Write the two files and nothing else. You must **not** run `git push`, `gh pr create`,
 `gh pr ready`, or `gh pr merge` — pushing the draft branch and opening the **draft** PR
-is the deterministic `pdca-autobook publish` step; marking it ready/merge is the human's.
+is the deterministic `autobook-pdca publish` step; marking it ready/merge is the human's.
 
 ## Ending the session
 
 Once `commit-msg.txt` and `pr-description.md` are written and the human is satisfied,
 confirm in one line that both are ready and that ending the session hands back to
-`pdca-autobook publish` (which validates them against T4, then opens the draft PR). Then stop.
+`autobook-pdca publish` (which validates them against T4, then opens the draft PR). Then stop.

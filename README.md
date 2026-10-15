@@ -12,7 +12,7 @@ code); a model is invoked only at the five **leaves**. See
 
 ## Prerequisites
 
-`make install-check` (or `pdca-autobook doctor` once installed) reports the harness-universal
+`make install-check` (or `autobook-pdca doctor` once installed) reports the harness-universal
 tools and the configured leaf CLIs and prints the exact fix for anything missing. (Your gate
 toolchain is only checked if you declare it — see the last bullet.)
 
@@ -29,30 +29,30 @@ toolchain is only checked if you declare it — see the last bullet.)
   `codex`) it reports the CLI as missing with a hint, and you install it yourself.
 - whatever your **gates** shell out to (`pdca.toml` `[[gates.checks]]`) — provision it via
   `[install].extra_bootstrap` (survives `copier update`). Note `make install-check` doesn't run
-  that command; declare the tools as `[[doctor.checks]]` rows so `pdca-autobook doctor` verifies them.
+  that command; declare the tools as `[[doctor.checks]]` rows so `autobook-pdca doctor` verifies them.
 
 ## Install + run
 
 Bootstrap once (per platform), then drive the cycle with the **console script** —
-`pdca-autobook`, the cross-platform run interface:
+`autobook-pdca`, the cross-platform run interface:
 
 ```bash
-make install            # Ubuntu/macOS: .venv + the `pdca-autobook` console script
+make install            # Ubuntu/macOS: .venv + the `autobook-pdca` console script
 #   pwsh -File scripts/install.ps1   # Windows equivalent
 make setup              # ONCE: grant Claude read of the workspace
 ```
 
 ```bash
-pdca-autobook flow 123 --rehearse   # offline dry-run: PLANNED → … → COMPLETE on stubs
-pdca-autobook flow 123              # run the whole cycle for issue 123 (live)
-pdca-autobook flow 123 124 125      # several ids → batch (lanes + cheap-first sign-off)
-pdca-autobook                       # the status dashboard (bare invocation)
+autobook-pdca flow 123 --rehearse   # offline dry-run: PLANNED → … → COMPLETE on stubs
+autobook-pdca flow 123              # run the whole cycle for issue 123 (live)
+autobook-pdca flow 123 124 125      # several ids → batch (lanes + cheap-first sign-off)
+autobook-pdca                       # the status dashboard (bare invocation)
 ```
 
 Before `make install`, run it from source as `python -m pdca_harness.cli flow 123`
 (with `PYTHONPATH=src`).
 
-Run `pdca-autobook flow` **in a real terminal** — the Plan, sign-off, publish and Act
+Run `autobook-pdca flow` **in a real terminal** — the Plan, sign-off, publish and Act
 steps open Claude interactively. **Trust:** the first interactive session asks once to
 *trust* the project — a one-time **global** setting (`~/.claude.json`), not something
 `make setup` can write (`setup` handles file *permissions*). Accept it.
@@ -79,23 +79,23 @@ When a Plan/sign-off/publish session ends, exit Claude (**Ctrl-D**) to let the f
 
 ## Commands
 
-Run the cycle through `pdca-autobook` (the console script). `make` is bootstrap-only.
+Run the cycle through `autobook-pdca` (the console script). `make` is bootstrap-only.
 
 | Command | What it does |
 |---|---|
-| `pdca-autobook` | The status dashboard (bare invocation). |
-| `pdca-autobook flow <id> [--from-csv PATH] [--no-publish] [--no-act] [--by NAME] [--lanes N]` | Run the full cycle for one issue. On an accept it opens a draft PR (`--no-publish` stops at COMPLETE); Act runs by default (`--no-act` skips); `--by` sets §9 attribution. |
-| `pdca-autobook flow <id> <id> …` | **Batch**: several ids fan out across lanes; unbriefed ids are auto-planned (one shared Plan session); sign off cheap-first. |
-| `pdca-autobook flow --from-csv PATH` | Plan a batch the planner picks from a tracker export, then drive it. |
-| `pdca-autobook flow <id> … --rehearse` | Dry-run the *same* control flow on stub leaves + stub gates in an isolated bundle root — **no Claude, no live gates, instant**. |
-| `pdca-autobook flow <id> … --from-briefs DIR` | Init any missing bundle from `DIR/<id>.md` before driving. |
-| `pdca-autobook status` / `queue` | List bundle states / the cheap-first sign-off burn-down. |
-| `pdca-autobook publish <id> [--dry-run]` | Re-publish an accepted bundle as a draft PR (the flow does this on accept). |
-| `pdca-autobook signoff <id> --accept` | Record the human Check sign-off (refused while §6 NEEDS-HUMAN is open). |
-| `pdca-autobook try <id>` | Launch the patched build from the bundle's worktree so you can hands-on test it during Check (needs `[manual_test].cmd` + `[driver].worktree`). |
-| `pdca-autobook act index` / `act log --date <d>` | Cross-cycle Act tooling. |
-| `pdca-autobook triage <pr>` | Ingest a published PR's external review findings into the Act ledger (BUG files a follow-up issue; the rest become act-log candidates). |
-| `pdca-autobook record [<id> …]` | Commit finished result bundles to this repo as one batch commit (needs `[records]` enabled; `pr` mode opens one draft PR). |
+| `autobook-pdca` | The status dashboard (bare invocation). |
+| `autobook-pdca flow <id> [--from-csv PATH] [--no-publish] [--no-act] [--by NAME] [--lanes N]` | Run the full cycle for one issue. On an accept it opens a draft PR (`--no-publish` stops at COMPLETE); Act runs by default (`--no-act` skips); `--by` sets §9 attribution. |
+| `autobook-pdca flow <id> <id> …` | **Batch**: several ids fan out across lanes; unbriefed ids are auto-planned (one shared Plan session); sign off cheap-first. |
+| `autobook-pdca flow --from-csv PATH` | Plan a batch the planner picks from a tracker export, then drive it. |
+| `autobook-pdca flow <id> … --rehearse` | Dry-run the *same* control flow on stub leaves + stub gates in an isolated bundle root — **no Claude, no live gates, instant**. |
+| `autobook-pdca flow <id> … --from-briefs DIR` | Init any missing bundle from `DIR/<id>.md` before driving. |
+| `autobook-pdca status` / `queue` | List bundle states / the cheap-first sign-off burn-down. |
+| `autobook-pdca publish <id> [--dry-run]` | Re-publish an accepted bundle as a draft PR (the flow does this on accept). |
+| `autobook-pdca signoff <id> --accept` | Record the human Check sign-off (refused while §6 NEEDS-HUMAN is open). |
+| `autobook-pdca try <id>` | Launch the patched build from the bundle's worktree so you can hands-on test it during Check (needs `[manual_test].cmd` + `[driver].worktree`). |
+| `autobook-pdca act index` / `act log --date <d>` | Cross-cycle Act tooling. |
+| `autobook-pdca triage <pr>` | Ingest a published PR's external review findings into the Act ledger (BUG files a follow-up issue; the rest become act-log candidates). |
+| `autobook-pdca record [<id> …]` | Commit finished result bundles to this repo as one batch commit (needs `[records]` enabled; `pr` mode opens one draft PR). |
 | `make` / `make check` | Self-test (full / fast offline). |
 | `make install` / `make setup` | Bootstrap: console script in `.venv/` / Claude read-permissions. |
 
@@ -106,7 +106,7 @@ heartbeat. Let it run.
 ## Gates (what makes a change "verified")
 
 Configured in [pdca.toml](pdca.toml) `[[gates.checks]]`, single-sourced for the
-local driver and CI (`pdca-autobook gates` / `pdca-autobook gates --working-tree`). Until you add real
+local driver and CI (`autobook-pdca gates` / `autobook-pdca gates --working-tree`). Until you add real
 rows the driver uses an all-PASS stub fallback — fill the gates first (see
 [docs/INTEGRATION.md](docs/INTEGRATION.md) §4). Guidance learned the hard way:
 

@@ -42,7 +42,7 @@ engine/
 
 Gate `cmd`s in `pdca.toml` reference these by path, e.g.
 `cmd = "./engine/scripts/run-verify.sh"`. The **same** command runs locally (the
-driver) and in CI (`pdca-autobook gates --working-tree`) — single-sourced, no drift.
+driver) and in CI (`autobook-pdca gates --working-tree`) — single-sourced, no drift.
 
 ## The two gate shapes that matter
 

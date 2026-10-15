@@ -3,8 +3,8 @@
 #
 # A gate row in pdca.toml is a shell command run from the project root, so a row that
 # invokes the harness has to name something that exists in EVERY documented install
-# layout — not just the one the author happened to be running. A bare `pdca-autobook` is not
-# that: the console script lives in the project venv, and running `.venv/bin/pdca-autobook`
+# layout — not just the one the author happened to be running. A bare `autobook-pdca` is not
+# that: the console script lives in the project venv, and running `.venv/bin/autobook-pdca`
 # does not put its own directory on PATH. Reviewers hit this repeatedly — the T4 row came
 # back as "no pdca.toml found" or plain 127, read as an absent gate rather than an
 # unresolvable one (upstream eduralph/pdca-harness#441).
@@ -20,11 +20,11 @@
 #                           machine-global that may belong to a different one. Not
 #                           hypothetical here — this instance runs Do/Check in `git
 #                           worktree` siblings that have no .venv of their own, so a
-#                           `~/.local/bin/pdca-autobook` there resolves to the MAIN checkout's
+#                           `~/.local/bin/autobook-pdca` there resolves to the MAIN checkout's
 #                           venv and the gate would silently lint this bundle with the
 #                           other tree's harness. The package is dependency-free
 #                           (pyproject.toml), so the source run needs nothing installed.
-#   4. pdca-autobook on PATH  — pipx / system install, for a layout with no venv and no src.
+#   4. autobook-pdca on PATH  — pipx / system install, for a layout with no venv and no src.
 #                           The name is the console script from pyproject.toml, never a
 #                           bare `pdca`: that is a SIBLING project's install on this
 #                           machine, and running the wrong harness is worse than not
@@ -37,7 +37,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [ -n "${PDCA_CLI:-}" ]; then
   # Read the override the way a shell reads a command line, not by splitting on bare
-  # whitespace: `read -a` would hand `exec` the first word of `/opt/My Tools/pdca-autobook`
+  # whitespace: `read -a` would hand `exec` the first word of `/opt/My Tools/autobook-pdca`
   # and exit 127 — the exact failure this launcher exists to remove, reintroduced through
   # the escape hatch, on the platforms where a spaced path is ordinary. Two shapes, so the
   # common one needs no quoting:
@@ -61,16 +61,16 @@ if [ -n "${PDCA_CLI:-}" ]; then
     echo "scripts/pdca: \$PDCA_CLI is set but names no command: $PDCA_CLI" >&2
     exit 127
   fi
-elif [ -x "$here/.venv/bin/pdca-autobook" ]; then
-  run=("$here/.venv/bin/pdca-autobook")
-elif [ -x "$here/.venv/Scripts/pdca-autobook.exe" ]; then
-  run=("$here/.venv/Scripts/pdca-autobook.exe")
+elif [ -x "$here/.venv/bin/autobook-pdca" ]; then
+  run=("$here/.venv/bin/autobook-pdca")
+elif [ -x "$here/.venv/Scripts/autobook-pdca.exe" ]; then
+  run=("$here/.venv/Scripts/autobook-pdca.exe")
 elif [ -f "$here/src/pdca_harness/cli.py" ]; then
   run=(env "PYTHONPATH=$here/src" "${PDCA_PYTHON:-python3}" -m pdca_harness.cli)
-elif command -v pdca-autobook >/dev/null 2>&1; then
-  run=(pdca-autobook)
+elif command -v autobook-pdca >/dev/null 2>&1; then
+  run=(autobook-pdca)
 else
-  echo "scripts/pdca: no pdca-autobook CLI found — no $here/.venv install, no" \
+  echo "scripts/pdca: no autobook-pdca CLI found — no $here/.venv install, no" \
        "$here/src/pdca_harness, none on PATH. Install it (\`make install\` /" \
        "\`pip install -e .\`) or point \$PDCA_CLI at the CLI." >&2
   exit 127

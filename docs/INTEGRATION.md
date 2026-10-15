@@ -34,7 +34,7 @@
 - **Issue-ID format:** `#123` (GitHub integer; bare `#123` in commit/PR text).
 - **Cross-link form (commit/PR → tracker):** `Fixes #nnnn` (GitHub auto-close) —
   `[tracker].issue_trailer = "Fixes #{id}"` in `pdca.toml`. A ticketless work item
-  uses `pdca-autobook publish --no-issue` (omits the trailer; records the bundle
+  uses `autobook-pdca publish --no-issue` (omits the trailer; records the bundle
   `id_pending`).
 - **Status → disposition mapping:** GitHub `open` → fixable at Plan; `closed` set on
   merge at Check. Labels (`bug`, `enhancement`) carry the rest; no custom state
@@ -249,9 +249,9 @@ self-reported difficulty field. `security-review` grades the patch against
 | Threat-model touch check | `engine/scripts/check-threat-model-touch.sh` | `T2-threat-model` | [built — advisory] |
 | Target dependency install | `engine/scripts/install-target-deps.sh` | `[install].extra_bootstrap` (`make install`) | [built] |
 | CLI resolver for gate rows | `scripts/pdca` | `./scripts/pdca contribcheck` | [built] |
-| Driver | `src/pdca_harness/` | `pdca-autobook run <id>` | [built — live leaves] |
-| Act tooling (L4) | `src/pdca_harness/act.py` | `pdca-autobook act index`, `pdca-autobook act log --date <d>` | [built] |
-| Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `pdca-autobook gates [<id>] [--working-tree]` | [built — C4-ci, C4-verify, T4, T2] |
+| Driver | `src/pdca_harness/` | `autobook-pdca run <id>` | [built — live leaves] |
+| Act tooling (L4) | `src/pdca_harness/act.py` | `autobook-pdca act index`, `autobook-pdca act log --date <d>` | [built] |
+| Gates (single-sourced) | `pdca.toml` `[[gates.checks]]` | `autobook-pdca gates [<id>] [--working-tree]` | [built — C4-ci, C4-verify, T4, T2] |
 | Reviewer role prompt | `agents/reviewer.md` (canonical body; inlined for codex) | (model leaf) | [built — command mode] |
 | Security-review role prompt | `agents/security-review.md`; `.claude/agents/security-review.md` | (advisory leaf) | [built — always on] |
 | Builder role prompt | `agents/builder.md`; `.claude/agents/builder.md` + `.claude/hooks/builder_guard.py` | (model leaf) | [built — ready-mark blocked] |
@@ -277,7 +277,7 @@ PDCA **supplements** Autobook's PR governance; it does not replace it.
 | `ci` (`nox -s gate`) | `./engine/nox.sh gate` via `C4-ci` | Both run the *same* command — one definition, in `../autobook/noxfile.py`. |
 
 `ship_ci_workflow = true` (autobook-pdca#3): `.github/workflows/check-gates.yml` runs
-`pdca-autobook gates --working-tree` on this repo's PRs. Its only repo-scoped row is
+`autobook-pdca gates --working-tree` on this repo's PRs. Its only repo-scoped row is
 C4-ci, which reports unverifiable there because CI has no Autobook checkout; Autobook's
 own CI runs that gate on Autobook's PRs. `.github/workflows/require-linked-issue.yml`
 holds this repo's PRs to the same linked-issue rule as Autobook's.
@@ -301,7 +301,7 @@ splitter), as in nl-shell-pdca.
 
 The four `interactive = true` leaves — planner, sign-off, publisher, Act — hand the terminal
 to a human+model REPL and block there. That means the human has to be at the terminal the
-flow runs in, for the whole batch: a `pdca-autobook flow` over several bundles can park on one
+flow runs in, for the whole batch: a `autobook-pdca flow` over several bundles can park on one
 sign-off adjudication for hours because nobody is at that machine.
 
 Claude Code's `--remote-control` flag removes the constraint. Add it to an interactive
