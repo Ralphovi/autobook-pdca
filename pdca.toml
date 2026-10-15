@@ -1137,6 +1137,23 @@ cmd = 'test -f "${AUTOBOOK_REPO:-../autobook}/.oss-scanner/threat_model.md"'
 hint = "the security-review advisory leaf rates every patch against it (Ralphovi/autobook#18); pull ../autobook"
 level = "WARN"
 
+# Autobook's test environment (Ralphovi/autobook testenv/): C4-verify runs book-process
+# and paperless tests there. WARN, not required: without it those tests do not run and
+# such a bundle is UNVERIFIABLE, which is safe — just not useful.
+[[doctor.checks]]
+group = "autobook pdca"
+id = "docker"
+cmd = "docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1"
+hint = "install Docker with the compose plugin and add yourself to the docker group — C4-verify runs book-process and paperless tests in ../autobook/testenv/"
+level = "WARN"
+
+[[doctor.checks]]
+group = "autobook pdca"
+id = "testenv"
+cmd = 'test -x "${AUTOBOOK_REPO:-../autobook}/testenv/run"'
+hint = "pull ../autobook — testenv/ lands with Ralphovi/autobook#48"
+level = "WARN"
+
 [[doctor.checks]]
 group = "autobook pdca"
 id = "bash4"

@@ -145,6 +145,15 @@ class Gates(unittest.TestCase):
         self.assertVerdict(self._run(VERIFY), 77, "no patch.diff")
 
     # -- Autobook additions ---------------------------------------------------------
+    def test_book_test_without_a_test_environment_is_unverifiable(self) -> None:
+        # The throwaway project has no testenv/, so the applier-marked test runs nowhere.
+        self._patch({"src/demo/calc.py": FIXED,
+                     "tests/test_add.py": "import pytest\n\n\n@pytest.mark.applier\n"
+                                          + ADD_TEST.split("\n\n\n", 1)[1]})
+        result = self._run(VERIFY)
+        self.assertVerdict(result, 77, "0 tests ran with the fix applied")
+        self.assertIn("they are not run", result.stdout)
+
     def test_applier_only_test_is_deselected_and_unverifiable(self) -> None:
         self._patch({"src/demo/calc.py": FIXED,
                      "tests/test_add.py": "import pytest\n\n\n@pytest.mark.applier\n"

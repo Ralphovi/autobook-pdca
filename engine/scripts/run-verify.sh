@@ -166,13 +166,40 @@ DEP_RC=0
 "$PY" "$ENGINE/lib/sync_deps.py" "$WT" "${PDCA_DEPS_STAMP:-$ENGINE/../../.venv/.autobook-deps.json}" || DEP_RC=$?
 [ "$DEP_RC" -eq 0 ] || exit 77
 
-REPORT="$(mktemp)"
-trap 'rm -f "$REPORT"' EXIT
+REPORT="$(mktemp)" REPORT2="$(mktemp)"
+trap 'rm -f "$REPORT" "$REPORT2"' EXIT
 RAN=0 FAILED=0 ERRORS=0 COLLECT=0
 
+# Book-process and paperless tests (autobook-pdca#7). They run in Autobook's throwaway
+# test environment (the worktree's testenv/: GnuCash bindings, PostgreSQL, paperless-ngx;
+# synthetic data only, no outbound network) — and only when the bundle's tests use those
+# markers, so a pipeline-only cycle never starts Docker. One compose project per lane;
+# the worktree is mounted read-only, so the red leg's revert is visible inside at once.
+# No Docker, or no testenv/ in the worktree: the container leg is skipped, and a bundle
+# whose only tests need it runs 0 tests — UNVERIFIABLE, never a verdict.
+TESTENV=0
+TESTENV_PROJECT="autobook-pdca-l${PDCA_LANE:-0}"
+TESTENV_COMPOSE=(docker compose -f "$WT/testenv/compose.yaml" -p "$TESTENV_PROJECT")
+if (cd "$WT" && grep -qE '\b(applier|live_paperless)\b' "${TESTS[@]}" 2>/dev/null); then
+  if [ -x "$WT/testenv/run" ] && command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    echo "== test environment: starting $TESTENV_PROJECT (book-process / paperless tests)"
+    tlog="$(mktemp)"
+    if AUTOBOOK_SRC="$WT" AUTOBOOK_TESTENV_PROJECT="$TESTENV_PROJECT" "$WT/testenv/run" up >"$tlog" 2>&1; then
+      TESTENV=1
+    else
+      tail -n 20 "$tlog"
+      echo "PDCA-UNVERIFIABLE: Autobook's test environment did not start — a machine problem, not evidence about the patch"
+      rm -f "$tlog"; exit 77
+    fi
+    rm -f "$tlog"
+  else
+    echo "   (bundle has book-process / paperless tests, but no Docker or no testenv/ in the worktree: they are not run)"
+  fi
+fi
+
 run_tests() {
-  local rc=0 pycache
-  rm -f "$REPORT"
+  local rc=0 crc=0 pycache r2=0 f2=0 e2=0 c2=0
+  rm -f "$REPORT" "$REPORT2"
   # A fresh, empty bytecode cache per leg. Python trusts a cached .pyc whose source has
   # the same size and mtime second, and reverting `a + b` to `a - b` changes neither — so
   # without this the red leg can silently run the green leg's compiled code (found by
@@ -182,8 +209,24 @@ run_tests() {
     "$PY" -m pytest -p no:cacheprovider -q -m "not applier and not live_paperless" --junitxml="$REPORT" "${TESTS[@]}" 2>&1 || rc=$?
   rm -rf "$pycache"
   read -r RAN FAILED ERRORS COLLECT < <("$PY" "$ENGINE/lib/junit_count.py" "$REPORT")
-  echo "   (pytest exit $rc; ran $RAN, failed $FAILED, setup errors $ERRORS, import/collection errors $COLLECT)"
-  return "$rc"
+  echo "   (host: pytest exit $rc; ran $RAN, failed $FAILED, setup errors $ERRORS, import/collection errors $COLLECT)"
+  if [ "$TESTENV" -eq 1 ]; then
+    AUTOBOOK_SRC="$WT" "${TESTENV_COMPOSE[@]}" exec -T book python3 -m pytest -p no:cacheprovider -q \
+      -o addopts="-ra --strict-markers" -m "applier or live_paperless" \
+      --junitxml=/tmp/pdca-c4.xml "${TESTS[@]}" 2>&1 || crc=$?
+    AUTOBOOK_SRC="$WT" "${TESTENV_COMPOSE[@]}" exec -T book cat /tmp/pdca-c4.xml >"$REPORT2" 2>/dev/null || true
+    read -r r2 f2 e2 c2 < <("$PY" "$ENGINE/lib/junit_count.py" "$REPORT2")
+    echo "   (test environment: pytest exit $crc; ran $r2, failed $f2, setup errors $e2, import/collection errors $c2)"
+    RAN=$((RAN + r2)) FAILED=$((FAILED + f2)) ERRORS=$((ERRORS + e2)) COLLECT=$((COLLECT + c2))
+  fi
+  # One verdict for the leg: exit 5 ("no tests collected") is neutral — the host run
+  # collects nothing when every test needs the environment; a leg in which nothing ran
+  # at all is caught by the RAN checks below.
+  if { [ "$rc" -ne 0 ] && [ "$rc" -ne 5 ]; } || { [ "$crc" -ne 0 ] && [ "$crc" -ne 5 ]; } \
+     || [ $((FAILED + ERRORS + COLLECT)) -gt 0 ]; then
+    return 1
+  fi
+  return 0
 }
 
 echo "== C4 green leg: bundle test(s) with the fix applied: ${TESTS[*]}"

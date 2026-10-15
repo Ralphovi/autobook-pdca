@@ -39,10 +39,18 @@
 - **Status → disposition mapping:** GitHub `open` → fixable at Plan; `closed` set on
   merge at Check. Labels (`bug`, `enhancement`) carry the rest; no custom state
   machine. **Milestones** follow architecture ch.9's execution order; the planner
-  takes an issue's `Depends on:` line as its prerequisites. Issues labelled
-  **`human-run`** need GnuCash or real data: their tests run under `-m applier`, which
-  C4-verify deselects, so PDCA reports them unverifiable and the human runs
-  `nox -s applier` against the synthetic book and records the result at sign-off.
+  takes an issue's `Depends on:` line as its prerequisites.
+- **Book-process and paperless tests run in Autobook's test environment.** When a
+  bundle's tests use the `applier` or `live_paperless` marker, C4-verify starts the
+  worktree's `testenv/` (GnuCash 5.14 bindings, PostgreSQL, paperless-ngx 3.3.0;
+  synthetic data only, no outbound network; one compose project per lane,
+  `autobook-pdca-l<lane>`) and runs them there for both legs, so those cycles get a
+  real red→green. Without Docker or `testenv/` they do not run and the bundle is
+  unverifiable. Stacks stay up between cycles for speed; `docker compose ls` lists
+  them and `docker compose -p autobook-pdca-l<lane> down -v` removes one.
+  **Real data never enters PDCA:** the backtest on the user's history, the D1/D2
+  validation runs and anything that opens a real book stay human-run, outside the
+  cycle (the `human-run` label marks the issues whose milestone closes on such a run).
 - **Per-release field updated on a fix:** none. Autobook is pre-release and has no
   version field to maintain; the closed-by-PR link records the fix. Revisit at the
   first tagged release.
