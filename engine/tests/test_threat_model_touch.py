@@ -48,6 +48,13 @@ class ThreatModelTouch(unittest.TestCase):
         r = self._run(["AGENTS.md"])
         self.assertEqual(r.returncode, 77, r.stdout)
 
+    def test_0002_surfaces_count_as_security_relevant(self) -> None:
+        for path in ("src/autobook/pipeline/bill_matcher.py", "src/autobook/pipeline/admission.py",
+                     "src/autobook/book/exporter.py", "src/autobook/pipeline/staging.py"):
+            with self.subTest(path=path):
+                r = self._run([path])
+                self.assertEqual(r.returncode, 77, r.stdout)
+
     def test_security_change_with_threat_model_passes(self) -> None:
         r = self._run(["src/autobook/adapter/redact.py", ".oss-scanner/threat_model.md"])
         self.assertEqual(r.returncode, 0, r.stdout)

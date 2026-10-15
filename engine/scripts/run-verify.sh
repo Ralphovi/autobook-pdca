@@ -32,7 +32,8 @@
 # Autobook adds its repo config (pyproject.toml, noxfile.py, typos.toml, editor and
 # agent files) to that set: reverting it can't change what a test sees.
 #
-# Applier tests never run here. `-m "not applier"` mirrors Autobook's own gate: they need
+# Applier tests never run here, nor tests that need a live paperless-ngx
+# (`-m "not applier and not live_paperless"`). Applier tests mirror Autobook's own gate: they need
 # the system python3-gnucash and a restored copy of a book, never an unattended driver.
 # A bundle whose only test is an applier test therefore runs 0 tests: UNVERIFIABLE.
 # ---------------------------------------------------------------------------------
@@ -158,6 +159,13 @@ if [ "${#PROD[@]}" -eq 0 ]; then
   echo "PDCA-UNVERIFIABLE: no behavioral production change to revert (test-only or docs-only patch)"; exit 77
 fi
 
+# A patch that adds a dependency must not fail its own green leg on an ImportError the
+# machine caused (autobook-pdca#5): install the worktree's declared dependencies into the
+# instance venv when they changed. A no-op while the list is empty or unchanged.
+DEP_RC=0
+"$PY" "$ENGINE/lib/sync_deps.py" "$WT" "${PDCA_DEPS_STAMP:-$ENGINE/../../.venv/.autobook-deps.json}" || DEP_RC=$?
+[ "$DEP_RC" -eq 0 ] || exit 77
+
 REPORT="$(mktemp)"
 trap 'rm -f "$REPORT"' EXIT
 RAN=0 FAILED=0 ERRORS=0 COLLECT=0
@@ -171,7 +179,7 @@ run_tests() {
   # engine/tests: test_genuine_red_then_green_passes_and_restores_the_tree).
   pycache="$(mktemp -d)"
   PYTHONPATH="$WT/src${PYTHONPATH:+:$PYTHONPATH}" PYTHONPYCACHEPREFIX="$pycache" \
-    "$PY" -m pytest -p no:cacheprovider -q -m "not applier" --junitxml="$REPORT" "${TESTS[@]}" 2>&1 || rc=$?
+    "$PY" -m pytest -p no:cacheprovider -q -m "not applier and not live_paperless" --junitxml="$REPORT" "${TESTS[@]}" 2>&1 || rc=$?
   rm -rf "$pycache"
   read -r RAN FAILED ERRORS COLLECT < <("$PY" "$ENGINE/lib/junit_count.py" "$REPORT")
   echo "   (pytest exit $rc; ran $RAN, failed $FAILED, setup errors $ERRORS, import/collection errors $COLLECT)"

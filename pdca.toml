@@ -21,6 +21,11 @@ author = "Eduard Ralph"
 # rubric_file = "AGENTS.md"
 # rubric_section = "Review rubric & protocol"   # ATX headings only (`## Heading`);
 #                                               # matched exactly or as a prefix.
+# ACTIVE (autobook-pdca#5): Autobook's AGENTS.md rubric — the recurring defect classes
+# (money, book writes, idempotency, double-booking, documents, privacy …) — reaches the
+# builder, the reviewer and the adversary alike. Resolved inside the target checkout.
+rubric_file = "AGENTS.md"
+rubric_section = "Review rubric & protocol"
 
 [paths]
 bundle_root = "results"
@@ -377,7 +382,7 @@ extra_bootstrap = "./engine/scripts/install-target-deps.sh"
 # like a gate command; "" ⇒ `pdca-autobook try` errors with a configure-me hint.
 [manual_test]
 # cmd = "python -m gramps"   # e.g. launch the app; a "./scripts/run-app.sh" wrapper also works
-# Empty until Autobook has an entry point (build order step 1 lands the backtest CLI). Then
+# Empty until Autobook has an entry point (build step 2 lands the backtest CLI, #25). Then
 # mirror nl-shell-pdca: the worktree's src/ on the instance venv, cwd = $PDCA_WORKTREE.
 cmd = ""
 
@@ -442,6 +447,19 @@ issue_url_pattern = "https://github.com/Ralphovi/autobook/issues/{id}"
 type = "github"
 role = "tracker"
 repo = "Ralphovi/autobook"
+
+# The design the issues implement (autobook-pdca#5). Each issue links its sections, but
+# the planner does not scan repos, so the documents themselves are copied into sources/:
+# both proposals (0002 governs the 0001 rows in its amendment table), the building blocks
+# and JSON contracts (ch.5), the runtime decision tree (ch.6), the crosscutting rules
+# (ch.8) and the execution order (ch.9).
+[[plan.source]]
+type = "file"
+path = "../autobook/docs/design/proposals/draft/*.md"
+
+[[plan.source]]
+type = "file"
+path = "../autobook/docs/design/architecture/0[5689]-*.md"
 
 # Publish mechanics — `pdca-autobook publish` and the flow's publish-on-accept (docs 03 §Check
 # closing step). Branch patterns are `{id}` / `{slug}` format strings; the
@@ -1089,8 +1107,8 @@ level = "WARN"
 [[doctor.checks]]
 group = "autobook applier (never a PDCA gate)"
 id = "python3-gnucash"
-cmd = "python3 -c 'import gnucash'"
-hint = "sudo apt install python3-gnucash — needed only for a local `nox -s applier`; no PDCA gate can reach it (see engine/nox.sh)"
+cmd = "python3 -c 'from gnucash import SessionOpenMode'"
+hint = "sudo apt install python3-gnucash (GnuCash 5.x: SessionOpenMode) — needed only for the human-run book-process tests (`nox -s applier`); no PDCA gate can reach it (see engine/nox.sh). Pre-5.x bindings lack SessionOpenMode and must not be used"
 level = "WARN"
 
 # ---------------------------------------------------------------------------
