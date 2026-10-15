@@ -50,10 +50,19 @@ example, deferrals it already tracks are settled — don't re-raise them).
    booked twice after a crash or re-run; a model's answer outside the live account tree is
    accepted; a raw memo, IBAN, document or credential reaches a model backend, a log, a
    pack or a fixture; a crash or hang reachable from a statement file; resource exhaustion
-   out of proportion to the input.
+   out of proportion to the input. From the paperless and book-process surfaces: a
+   statement admitted from OCR text, archive text or metadata instead of the original; a
+   bill linked to the wrong row (ambiguity rule bypassed, a correspondent-less or
+   unconfirmed bill feeding a rule, matching that depends on input order); document
+   content, a correspondent name or the paperless token reaching staging, a log or the
+   model adapter; an existing document link overwritten; a stamp written when stamping is
+   off, or read back to decide anything; a remote backend receiving a token off the
+   allowlist or an account name; a write that skips `session.save()` or the read-back; a
+   `num` written on a matched transaction, or an undo that deletes by `num` alone.
 3. Rate each finding on the threat model's scale and give **a concrete input or test that
    shows it** — a statement line, a memo string, a review-file edit, a crash point. A
-   vague worry is not a finding. Use synthetic data only: never a real memo or IBAN.
+   vague worry is not a finding. Use synthetic data only: never a real memo, IBAN,
+   document or correspondent name.
 4. Check that the patch's own test covers the attacker-reachable case. If the fix is
    security-relevant and the test only covers the friendly path, that is a finding.
 

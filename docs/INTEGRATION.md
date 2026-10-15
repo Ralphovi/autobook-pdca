@@ -14,11 +14,17 @@
 > cited below.
 > Maintained by Act (append changes; don't silently rewrite).
 >
-> **Current stage.** Autobook is *design-stage*: proposal 0001 exists, no
-> implementation does. Several rows below are therefore honestly `[planned]` rather
-> than filled with plausible-looking guesses — the first cycles run build order
-> steps 0–2, and the fixture/repro machinery cannot be specified before there is
-> code to reproduce against. Fill each row when the cycle that needs it arrives.
+> **Current stage.** Autobook is *design-stage*: proposal 0001 as amended by proposal
+> 0002, and the architecture description (`../autobook/docs/design/architecture/`,
+> ch.1–14), exist; no implementation does. The **execution order** is architecture
+> ch.9, and the tracker follows it as GitHub milestones `01 · 0 + D0` … `13 · 9`, one
+> issue per PDCA cycle. The first cycle is the package skeleton (Ralphovi/autobook#22).
+> Several rows below are honestly `[planned]` rather than filled with
+> plausible-looking guesses; fill each when the cycle that needs it arrives.
+>
+> **Naming.** The **book process** is the only process that links libgnucash: the
+> **exporter** (read-only, from build step 2) and the **applier** (writes, from step
+> 5). The nox session and pytest marker for its tests keep the name `applier`.
 
 ## 1. Tracker integration
 - **System / URL:** GitHub Issues — https://github.com/Ralphovi/autobook/issues.
@@ -32,7 +38,19 @@
   `id_pending`).
 - **Status → disposition mapping:** GitHub `open` → fixable at Plan; `closed` set on
   merge at Check. Labels (`bug`, `enhancement`) carry the rest; no custom state
-  machine, no milestones yet.
+  machine. **Milestones** follow architecture ch.9's execution order; the planner
+  takes an issue's `Depends on:` line as its prerequisites.
+- **Book-process and paperless tests run in Autobook's test environment.** When a
+  bundle's tests use the `applier` or `live_paperless` marker, C4-verify starts the
+  worktree's `testenv/` (GnuCash 5.14 bindings, PostgreSQL, paperless-ngx 3.3.0;
+  synthetic data only, no outbound network; one compose project per lane,
+  `autobook-pdca-l<lane>`) and runs them there for both legs, so those cycles get a
+  real red→green. Without Docker or `testenv/` they do not run and the bundle is
+  unverifiable. Stacks stay up between cycles for speed; `docker compose ls` lists
+  them and `docker compose -p autobook-pdca-l<lane> down -v` removes one.
+  **Real data never enters PDCA:** the backtest on the user's history, the D1/D2
+  validation runs and anything that opens a real book stay human-run, outside the
+  cycle (the `human-run` label marks the issues whose milestone closes on such a run).
 - **Per-release field updated on a fix:** none. Autobook is pre-release and has no
   version field to maintain; the closed-by-PR link records the fix. Revisit at the
   first tagged release.
@@ -140,7 +158,9 @@ self-reported difficulty field. `security-review` grades the patch against
   - **Anything that writes to a book, or changes how something is written.** The
     hard rules in Autobook's `AGENTS.md` (session mode, integer-cent money,
     reconciled flag, account creation, exact split sums, engine-API assertions,
-    idempotency via `num`) are not review-negotiable, and a change touching them
+    `session.save()` and read-back, proposal IDs in `num` only on created
+    transactions, never `create` on a scheduled-transaction occurrence) are not
+    review-negotiable, and a change touching them
     needs a human even when every gate is green — their failure mode is a silently
     wrong ledger, not a red test.
   - **Any threshold or confidence-gate change.** These move on backtest evidence
@@ -150,7 +170,16 @@ self-reported difficulty field. `security-review` grades the patch against
     model adapter, credential handling, or the content of a shareable rule pack.
   - **Adding or changing a scope exclusion** (securities, cross-currency splits),
     or reopening a row in proposal 0001's *Rejected alternatives* table.
-  - **Any test fixture that could plausibly derive from real statement data.**
+  - **Any test fixture that could plausibly derive from real statement data**, a real
+    document, a correspondent name or a paperless export.
+  - **Anything that writes to paperless** (stamp, tag, custom field), and any change to
+    which paperless representation is read (original vs archive/content, version
+    pinning) or to statement admission (balance check, checksum, overlap rule).
+  - **Any change to bill-match conditions** (exact amount, date window, correspondent
+    constraint, one-to-one rule, weak matches) or to a document-keyed rule's `auto`
+    default or tier-2 qualification.
+  - **Any change to approval or pre-marking** — what is pre-marked `a`, the LLM
+    pre-marking rule, or anything that would apply a row not in a saved review file.
 
 ## 5. Upstream-isn't-ahead routine
 - **What "upstream" is:** not applicable in the fork sense —
@@ -166,7 +195,12 @@ self-reported difficulty field. `security-review` grades the patch against
     longer search-indexed; mailing list archives still are (`site:lists.gnucash.org`).
   - **The ofxstatement plugins** (`Ralphovi/ofxstatement-{consorsbank,revolut,scalable}`)
     — a parsing defect belongs there, not here. Normalisation belongs here, not
-    there.
+    there. Whether they parse PDF statements is open until the D0 spikes (#3).
+  - **paperless-ngx 3.x** (`https://github.com/paperless-ngx/paperless-ngx`, REST API
+    and permission model) — check the API and its docs before relying on a field or
+    behaviour; duplicates are accepted by default, `/metadata/` follows the newest
+    document version unless `?version=` is pinned, and document history records an
+    actor (AI workflows as `System`).
 - **Search routine + tokenization gotchas:** search GnuCash by *feature name*
   (assistant, matcher, scheduled transaction) rather than by symbol; the C++/Scheme
   split means a symbol search misses whole subsystems.
@@ -255,8 +289,10 @@ None today. Add repo-prefixed rules (e.g. `autobook-pdca-C7`) that *tighten
 or add to* a generic rule — never weaken one — as running cycles surface them.
 
 A likely first candidate, once code exists: a C-rule requiring that any bundle
-touching classification reports **backtest numbers per method and per confidence
-band** in `SUMMARY.md`, since "seems better" is not a verdict this project accepts.
+touching classification reports **rolling-origin backtest numbers per method and per
+confidence band, novel-memo stratum included**, and any bundle touching the bill
+matcher reports **linkage numbers** (link rate, ambiguity rate), in `SUMMARY.md` —
+"seems better" is not a verdict this project accepts.
 
 ## Answering an interactive leaf from another device
 

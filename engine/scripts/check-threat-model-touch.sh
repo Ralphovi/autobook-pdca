@@ -21,7 +21,12 @@ for p in "${CHANGED[@]}"; do
     src/autobook/*knn*|src/autobook/*threshold*|src/autobook/*classif*|src/autobook/*correlat*| \
     src/autobook/*dedup*|src/autobook/*fitid*|src/autobook/*ingest*|src/autobook/*pack*| \
     src/autobook/*launch*|src/autobook/*log*|src/autobook/*secret*|src/autobook/*credential*| \
-    src/autobook/*paperless*|AGENTS.md|SECURITY.md|docs/design/architecture/14-threat-model.md)
+    src/autobook/*paperless*|src/autobook/*statement*|src/autobook/*admission*| \
+    src/autobook/*balance*|src/autobook/*staging*|src/autobook/*bill*|src/autobook/*match*| \
+    src/autobook/*document*|src/autobook/*doclink*|src/autobook/*stamp*|src/autobook/*disposition*| \
+    src/autobook/*export*|src/autobook/*corpus*|src/autobook/*rules*|src/autobook/*config*| \
+    src/autobook/*transfer*|src/autobook/*undo*|src/autobook/book/*| \
+    AGENTS.md|SECURITY.md|docs/design/architecture/14-threat-model.md)
       SECURITY+=("$p") ;;
   esac
 done
