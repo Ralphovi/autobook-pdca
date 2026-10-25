@@ -285,7 +285,7 @@ size_guard = "off"
 # that dies gets a post-mortem (last sample + the scope's journal excerpt) appended to its
 # `*.error.log`. So an OOM kill names WHAT filled the scope — e.g. `1187× python3 -m
 # unittest …` — not just that it died.
-# leaf_memory_max = "8G"
+leaf_memory_max = "16G"   # as wyrd-pdca and client-rust-pdca (pdca-harness#779)
 
 
 # A-priori size-estimate weights + cutoffs (issues #320/#359). [driver.sizing] tunes the
