@@ -61,3 +61,6 @@ results/issue_selftest/
 *.mt940
 *.sta
 *.camt*.xml
+
+# Claude Code machine-local files: may hold recorded commands with secrets; never commit
+CLAUDE.local.md
