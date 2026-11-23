@@ -1,0 +1,854 @@
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index 06c99e1..7c64b23 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -135,7 +135,55 @@ Strips SEPA boilerplate (`EREF+`, `MREF+`, `CRED+`, `SVWZ+`, `ABWA+`), dates, ca
+ fragments and sequence numbers until the merchant token remains. **Profiles are
+ per source account**, loaded from the installed package and from a user
+ directory, so a new bank or country does not need a release. The normaliser
+-version is part of the version gate tuple.
++version is part of the version gate tuple. All normalisation happens here; the
++raw memo is never changed (`NormalisedMemo.raw_memo`).
++
++**API** (`autobook.pipeline.normaliser`): `load(user_dir=None)` returns a
++`Normaliser`; `Normaliser.normalise(raw_memo, source_account)` returns a
++`NormalisedMemo` (`raw_memo`, `token`, `profile`, `version`). Every bad profile,
++pattern, mapping or account path raises `NormaliserError` (a `ValueError`) naming
++the file; nothing falls back silently.
++
++**Profile format.** A profile is a TOML file `<name>.toml`: an ordered list of
++`[[rules]]`, each with exactly one key, `pattern`, a Python `re` expression
++(literal TOML strings keep backslashes). Patterns run in file order on the
++upper-cased memo, so they are written in upper case, and every match is replaced
++by a space. Then whitespace runs collapse to one space and both ends are
++stripped; the result is the token, which may be empty. Any other key, a
++non-string pattern or a pattern that does not compile is an error.
++
++**Package profiles** live in `src/autobook/pipeline/profiles/`: `default` (card
++and reference fragments, dates, standalone digit runs, `SAGT DANKE`) and `sepa`
++(`default`, plus the `EREF+`, `MREF+`, `CRED+` and `ABWA+` tags with their values
++up to the next SEPA tag, and the `SVWZ+` tag alone, keeping the purpose text). A
++tag is found even with no space before it, as some exports join the fields.
++
++**User directory and override.** `$XDG_CONFIG_HOME/autobook/normaliser/` (see
++section 8.8), or `~/.config/autobook/normaliser/` when `XDG_CONFIG_HOME` is unset,
++empty or relative (the XDG spec says to ignore a relative value). A `<name>.toml`
++there replaces the package profile of the same name entirely, with no merge; a new
++name adds a profile. Hidden files are ignored. A missing directory means package
++profiles only; one that exists but cannot be read, or that a broken symlink on its
++path makes unreachable, is an error. `accounts.toml` maps source accounts to
++profiles:
++
++```toml
++[[accounts]]
++path = ["Aktiva", "Girokonto"]   # the account path as a list, never a joined string
++profile = "sepa"
++```
++
++Each entry has exactly `path` and `profile`; an unknown profile or an account
++mapped twice is an error. An account with no entry uses `default`.
++
++**Version.** `Normaliser.version` is `"<NORMALISER_VERSION>-<12 hex digits>"`:
++the code's algorithm version, and a SHA-256 digest of every effective profile
++(name and rules, in order) and the account mapping, sorted by profile name and
++account path. No file path, file name or timestamp enters the digest, so the same
++files give the same version from any directory, and one changed rule or mapping
++line gives a different one. This string, not the integer alone, is what is
++recorded with every vector and in the version tuple, and what
++`proposals.normaliser_version` will hold.
+ 
+ ### Correlator
+ 
+diff --git a/docs/design/architecture/08-crosscutting-concepts.md b/docs/design/architecture/08-crosscutting-concepts.md
+index fae9068..8204860 100644
+--- a/docs/design/architecture/08-crosscutting-concepts.md
++++ b/docs/design/architecture/08-crosscutting-concepts.md
+@@ -147,6 +147,11 @@ TOML in `$XDG_CONFIG_HOME/autobook/`, mirroring GnuCash's own layout. Secrets in
+ the Secret Service. Every configuration value that can change a classification is
+ part of the version tuple.
+ 
++`normaliser/` holds the memo normaliser's data (section 5.2): `<name>.toml`
++profiles, each replacing the package profile of the same name, and `accounts.toml`,
++which maps source accounts to profiles. Their content is part of the normaliser
++version.
++
+ ## 8.9 Documentation currency
+ 
+ A change that adds or alters a CLI flag, configuration key, JSON contract field,
+diff --git a/src/autobook/pipeline/normaliser.py b/src/autobook/pipeline/normaliser.py
+index 727082b..bd34b3c 100644
+--- a/src/autobook/pipeline/normaliser.py
++++ b/src/autobook/pipeline/normaliser.py
+@@ -1,18 +1,278 @@
+ """Normaliser — building block of ch.5 section 5.2.
+ 
+-Design: `docs/design/architecture/05-building-block-view.md`.
++Design: `docs/design/architecture/05-building-block-view.md` (section 5.2,
++*Normaliser*) and `docs/design/architecture/08-*.md` (section 8.8).
+ 
+-Stub: the entry point exists so later build steps have a symbol to change; it
+-has no behaviour yet.
++Turns a raw bank memo into a merchant token. All normalisation lives here and is
++driven by data: named profiles (TOML files of regular expressions) shipped in
++`autobook/pipeline/profiles/` and overridable from a user directory. The
++normaliser's `version` changes whenever anything that affects a token changes.
+ 
+ Pipeline module: must never import `gnucash`.
+ """
+ 
+ from __future__ import annotations
+ 
+-__all__ = ["normalise"]
++import dataclasses
++import hashlib
++import importlib.resources
++import json
++import os
++import pathlib
++import re
++import tomllib
++from typing import TYPE_CHECKING, Any, Final
+ 
++if TYPE_CHECKING:
++    from collections.abc import Callable
++    from importlib.abc import Traversable
+ 
+-def normalise() -> None:
+-    """Entry point of the normaliser block."""
+-    raise NotImplementedError
++__all__ = [
++    "NORMALISER_VERSION",
++    "NormalisedMemo",
++    "Normaliser",
++    "NormaliserError",
++    "load",
++]
++
++# Bump when the code (not a profile) changes what a token looks like. It is one input
++# of `Normaliser.version` and is never recorded on its own: a profile edit would not
++# move it.
++NORMALISER_VERSION: Final[int] = 1
++
++_ACCOUNTS_FILE: Final = "accounts"  # accounts.toml is the mapping, never a profile
++_DEFAULT_PROFILE: Final = "default"
++_DIGEST_HEX_DIGITS: Final = 12
++
++
++class NormaliserError(ValueError):
++    """A profile, the account mapping or an account path was not accepted."""
++
++
++@dataclasses.dataclass(frozen=True)
++class NormalisedMemo:
++    """One normalised memo; ``raw_memo`` is the input, unchanged."""
++
++    raw_memo: str
++    token: str
++    profile: str
++    version: str
++
++
++@dataclasses.dataclass(frozen=True)
++class _Profile:
++    name: str
++    patterns: tuple[str, ...]
++    rules: tuple[re.Pattern[str], ...]
++
++
++class Normaliser:
++    """Normalises memos with the profiles in effect. Build one with `load`."""
++
++    def __init__(
++        self,
++        *,
++        profiles: dict[str, _Profile],
++        accounts: dict[tuple[str, ...], str],
++        version: str,
++    ) -> None:
++        self._profiles = profiles
++        self._accounts = accounts
++        self.version = version
++
++    def normalise(self, raw_memo: str, source_account: tuple[str, ...]) -> NormalisedMemo:
++        """Return the token for ``raw_memo``, using the profile mapped to the account."""
++        path = _account_path(source_account, "source account")
++        name = self._accounts.get(path, _DEFAULT_PROFILE)
++        text = raw_memo.upper()
++        for rule in self._profiles[name].rules:
++            text = rule.sub(" ", text)
++        token = " ".join(text.split())
++        return NormalisedMemo(
++            raw_memo=raw_memo, token=token, profile=name, version=self.version
++        )
++
++
++def load(user_dir: pathlib.Path | None = None) -> Normaliser:
++    """Load the package profiles, then the user directory's, and build a `Normaliser`.
++
++    ``None`` means ``$XDG_CONFIG_HOME/autobook/normaliser/`` (``~/.config`` when the
++    variable is unset, empty or relative). A missing directory means package profiles
++    only; one that exists but cannot be read, or sits behind a broken symlink, raises.
++    """
++    directory = _default_user_dir() if user_dir is None else user_dir
++    profiles = _load_package_profiles()
++    accounts: dict[tuple[str, ...], str] = {}
++    for file in _user_files(directory):
++        name = file.name.removesuffix(".toml")
++        if name == _ACCOUNTS_FILE:
++            accounts = _parse_accounts(_read_toml(file.read_bytes, str(file)), str(file))
++        else:
++            profiles[name] = _parse_profile(
++                name, _read_toml(file.read_bytes, str(file)), str(file)
++            )
++    if _DEFAULT_PROFILE not in profiles:
++        raise NormaliserError(f"no profile named {_DEFAULT_PROFILE!r} is available")
++    for path, name in accounts.items():
++        if name not in profiles:
++            raise NormaliserError(
++                f"accounts.toml: account {list(path)} names the unknown profile {name!r}"
++            )
++    return Normaliser(
++        profiles=profiles, accounts=accounts, version=_version(profiles, accounts)
++    )
++
++
++def _default_user_dir() -> pathlib.Path:
++    # The XDG Base Directory spec: a relative XDG_CONFIG_HOME is invalid and ignored,
++    # so the profiles in effect never depend on the current working directory.
++    config_home = os.environ.get("XDG_CONFIG_HOME", "")
++    if os.path.isabs(config_home):
++        base = pathlib.Path(config_home)
++    else:
++        base = pathlib.Path.home() / ".config"
++    return base / "autobook" / "normaliser"
++
++
++def _user_files(directory: pathlib.Path) -> list[pathlib.Path]:
++    """The ``*.toml`` files in the user directory; none when the directory is missing.
++
++    Only a missing directory means "no user files". One that exists but cannot be
++    listed raises, so a user's profiles and mapping are never dropped without a word
++    (``Path.exists`` and ``Path.glob`` swallow ``PermissionError``, so neither is used).
++    A broken symlink on the way (the directory or one of its parents) is not "missing"
++    either. Hidden names (an editor's lock or backup file) are not profiles.
++    """
++    try:
++        with os.scandir(directory) as entries:
++            return sorted(
++                pathlib.Path(entry.path)
++                for entry in entries
++                if entry.name.endswith(".toml")
++                and not entry.name.startswith(".")
++                and not entry.is_dir()
++            )
++    except FileNotFoundError as error:
++        broken = _broken_link_on_path(directory)
++        if broken is None:
++            return []
++        raise NormaliserError(
++            f"{directory}: cannot read the user directory: {broken} is a broken symlink"
++        ) from error
++    except OSError as error:  # PermissionError, NotADirectoryError, …
++        raise NormaliserError(
++            f"{directory}: cannot read the user directory: {error}"
++        ) from error
++
++
++def _broken_link_on_path(directory: pathlib.Path) -> pathlib.Path | None:
++    """The broken symlink that makes ``directory`` unreachable, if there is one.
++
++    The deepest part of the path that exists (without following a final link) decides:
++    a symlink there whose target is gone means the directory is configured but
++    unreachable; anything else means the directory is simply not there.
++    """
++    for part in (directory, *directory.parents):
++        if os.path.lexists(part):
++            if os.path.islink(part) and not os.path.exists(part):
++                return part
++            return None
++    return None
++
++
++def _load_package_profiles() -> dict[str, _Profile]:
++    root: Traversable = importlib.resources.files("autobook.pipeline") / "profiles"
++    profiles: dict[str, _Profile] = {}
++    for entry in sorted(root.iterdir(), key=lambda item: item.name):
++        if not entry.is_file() or not entry.name.endswith(".toml"):
++            continue
++        name = entry.name.removesuffix(".toml")
++        if name == _ACCOUNTS_FILE:
++            continue
++        where = f"package profile {entry.name}"
++        profiles[name] = _parse_profile(name, _read_toml(entry.read_bytes, where), where)
++    return profiles
++
++
++def _read_toml(read: Callable[[], bytes], where: str) -> dict[str, Any]:
++    try:
++        return tomllib.loads(read().decode("utf-8"))
++    except (OSError, ValueError) as error:  # TOMLDecodeError and UnicodeDecodeError
++        raise NormaliserError(f"{where}: cannot read as TOML: {error}") from error
++
++
++def _parse_profile(name: str, document: dict[str, Any], where: str) -> _Profile:
++    extra = sorted(set(document) - {"rules"})
++    if extra:
++        raise NormaliserError(
++            f"{where}: unknown top-level key(s) {extra}; only 'rules' is allowed"
++        )
++    rules = document.get("rules", [])
++    if not isinstance(rules, list):
++        raise NormaliserError(f"{where}: 'rules' must be an array of tables ([[rules]])")
++    patterns: list[str] = []
++    compiled: list[re.Pattern[str]] = []
++    for index, rule in enumerate(rules, start=1):
++        label = f"{where}: rule {index}"
++        if not isinstance(rule, dict) or set(rule) != {"pattern"}:
++            raise NormaliserError(f"{label}: a rule has exactly one key, 'pattern'")
++        pattern = rule["pattern"]
++        if not isinstance(pattern, str):
++            raise NormaliserError(f"{label}: 'pattern' must be a string")
++        try:
++            compiled.append(re.compile(pattern))
++        except re.error as error:
++            raise NormaliserError(f"{label}: invalid regular expression: {error}") from error
++        patterns.append(pattern)
++    return _Profile(name=name, patterns=tuple(patterns), rules=tuple(compiled))
++
++
++def _parse_accounts(document: dict[str, Any], where: str) -> dict[tuple[str, ...], str]:
++    extra = sorted(set(document) - {"accounts"})
++    if extra:
++        raise NormaliserError(
++            f"{where}: unknown top-level key(s) {extra}; only 'accounts' is allowed"
++        )
++    entries = document.get("accounts", [])
++    if not isinstance(entries, list):
++        raise NormaliserError(f"{where}: 'accounts' must be an array of tables ([[accounts]])")
++    mapping: dict[tuple[str, ...], str] = {}
++    for index, entry in enumerate(entries, start=1):
++        label = f"{where}: account {index}"
++        if not isinstance(entry, dict) or set(entry) != {"path", "profile"}:
++            raise NormaliserError(
++                f"{label}: an entry has exactly the keys 'path' and 'profile'"
++            )
++        path = _account_path(entry["path"], label)
++        profile = entry["profile"]
++        if not isinstance(profile, str):
++            raise NormaliserError(f"{label}: 'profile' must be a string")
++        if path in mapping:
++            raise NormaliserError(f"{label}: account {list(path)} is mapped twice")
++        mapping[path] = profile
++    return mapping
++
++
++def _account_path(value: object, where: str) -> tuple[str, ...]:
++    """An account path is a non-empty list of non-empty strings, never a joined string."""
++    if (
++        not isinstance(value, (list, tuple))
++        or not value
++        or not all(isinstance(part, str) and part for part in value)
++    ):
++        raise NormaliserError(
++            f"{where}: an account path is a non-empty list of non-empty strings, got {value!r}"
++        )
++    return tuple(value)
++
++
++def _version(profiles: dict[str, _Profile], accounts: dict[tuple[str, ...], str]) -> str:
++    # Canonical: sorted by profile name and by account path. No file path, file name
++    # (other than the profile name), or timestamp enters the digest.
++    canonical = {
++        "profiles": [[name, list(profiles[name].patterns)] for name in sorted(profiles)],
++        "accounts": [[list(path), accounts[path]] for path in sorted(accounts)],
++    }
++    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++    digest = hashlib.sha256(payload.encode("ascii")).hexdigest()
++    return f"{NORMALISER_VERSION}-{digest[:_DIGEST_HEX_DIGITS]}"
+diff --git a/src/autobook/pipeline/profiles/default.toml b/src/autobook/pipeline/profiles/default.toml
+new file mode 100644
+index 0000000..1c88514
+--- /dev/null
++++ b/src/autobook/pipeline/profiles/default.toml
+@@ -0,0 +1,26 @@
++# Package profile `default`: strips the noise around a merchant name, in general form.
++# Patterns are Python `re` syntax and run, in order, on the upper-cased memo; every
++# match is replaced by a space. Multi-word merchant names are left alone.
++
++# Boilerplate.
++[[rules]]
++pattern = '\bSAGT DANKE\b'
++
++# Card fragments: KARTE <digits>.
++[[rules]]
++pattern = '\bKARTE \d+'
++
++# Reference fragments: REF <digits>, NR. <digits>.
++[[rules]]
++pattern = '\bREF \d+'
++
++[[rules]]
++pattern = '\bNR\. *\d+'
++
++# Embedded dates: DD.MM. and DD.MM.YYYY.
++[[rules]]
++pattern = '\b\d{1,2}\.\d{1,2}\.(?:\d{4})?'
++
++# Standalone digit runs.
++[[rules]]
++pattern = '\b\d+\b'
+diff --git a/src/autobook/pipeline/profiles/sepa.toml b/src/autobook/pipeline/profiles/sepa.toml
+new file mode 100644
+index 0000000..52a2be2
+--- /dev/null
++++ b/src/autobook/pipeline/profiles/sepa.toml
+@@ -0,0 +1,34 @@
++# Package profile `sepa`: the SEPA fields, then everything `default` does.
++# A profile file has no include, so the `default` rules are repeated below, in the same
++# order; tests/test_normaliser.py fails when the two files drift apart.
++
++# The tag and its value, up to the next SEPA tag or the end of the memo. A tag is
++# found without a word boundary in front: some exports join the fields with no space
++# (`EREF+NOTPROVIDEDSVWZ+…`), and a missed tag would let a value run on over the
++# merchant name.
++[[rules]]
++pattern = '(?:EREF|MREF|CRED|ABWA)\+[\s\S]*?(?=(?:EREF|MREF|CRED|SVWZ|ABWA)\+|\Z)'
++
++# The payment purpose: only the tag goes, the text stays and is cleaned by the rules below.
++[[rules]]
++pattern = 'SVWZ\+'
++
++# --- the `default` rules ---
++
++[[rules]]
++pattern = '\bSAGT DANKE\b'
++
++[[rules]]
++pattern = '\bKARTE \d+'
++
++[[rules]]
++pattern = '\bREF \d+'
++
++[[rules]]
++pattern = '\bNR\. *\d+'
++
++[[rules]]
++pattern = '\b\d{1,2}\.\d{1,2}\.(?:\d{4})?'
++
++[[rules]]
++pattern = '\b\d+\b'
+diff --git a/tests/test_normaliser.py b/tests/test_normaliser.py
+new file mode 100644
+index 0000000..56ee1fb
+--- /dev/null
++++ b/tests/test_normaliser.py
+@@ -0,0 +1,384 @@
++"""The normaliser: profiles, user-directory overrides, account mapping and version.
++
++Every name the normaliser adds is reached through the module object inside the test
++body, so a tree without them fails the test instead of failing to collect it.
++"""
++
++from __future__ import annotations
++
++import importlib.resources
++import os
++import re
++import tomllib
++from typing import TYPE_CHECKING
++
++import pytest
++
++from autobook.pipeline import normaliser
++from tests.fixtures.synthetic import corpus_builder
++
++if TYPE_CHECKING:
++    import pathlib
++
++GIROKONTO = corpus_builder.GIROKONTO
++SEPA_TAGS = ("EREF+", "MREF+", "CRED+", "SVWZ+", "ABWA+")
++
++SEPA_MAPPING = """\
++[[accounts]]
++path = ["Aktiva", "Girokonto"]
++profile = "sepa"
++"""
++
++
++def _write(directory: pathlib.Path, name: str, text: str) -> pathlib.Path:
++    directory.mkdir(parents=True, exist_ok=True)
++    (directory / name).write_text(text, encoding="utf-8")
++    return directory
++
++
++def _text(result: normaliser.NormalisedMemo) -> str:
++    return result.token
++
++
++def _expected_token(raw_memo: str) -> str:
++    for merchant in corpus_builder.MERCHANTS:
++        if raw_memo.startswith(merchant.token):
++            return merchant.token
++    assert raw_memo.startswith(corpus_builder.NOVEL_MERCHANT), raw_memo
++    return corpus_builder.NOVEL_MERCHANT
++
++
++# --- (a) the corpus --------------------------------------------------------------
++
++
++@pytest.mark.parametrize("seed", [0, 1, 2])
++def test_every_corpus_row_normalises_to_its_merchant(seed: int, tmp_path: pathlib.Path) -> None:
++    loaded = normaliser.load(tmp_path)
++    rows = corpus_builder.build_corpus(seed).rows
++    assert rows
++    for row in rows:
++        result = loaded.normalise(row.raw_memo, row.source_account)
++        assert result.token == _expected_token(row.raw_memo), row.raw_memo
++        assert result.profile == "default"
++
++
++# --- (b) SEPA --------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    ("memo", "token"),
++    [
++        (
++            "EREF+NOTPROVIDED MREF+M0001 CRED+DE98ZZZ09999999999 "
++            "SVWZ+BEISPIELMARKT KARTE 4711 05.03. ABWA+ERFUNDEN PERSON",
++            "BEISPIELMARKT",
++        ),
++        (
++            "BEISPIELMARKT EREF+R20250305 MREF+M0002 CRED+DE98ZZZ09999999999 "
++            "SVWZ+SAGT DANKE 99",
++            "BEISPIELMARKT",
++        ),
++        (
++            "SVWZ+Muster Hausverwaltung REF 8812 05.03.2025 EREF+X9 MREF+Y9",
++            "MUSTER HAUSVERWALTUNG",
++        ),
++        ("SVWZ+neuheim kiosk NR. 55", "NEUHEIM KIOSK"),
++        # Fields joined with no space between a value and the next tag.
++        ("EREF+NOTPROVIDEDSVWZ+BEISPIELMARKT", "BEISPIELMARKT"),
++        ("EREF+123 MREF+456SVWZ+BEISPIELMARKT", "BEISPIELMARKT"),
++        ("SVWZ+BEISPIELMARKTEREF+ABC", "BEISPIELMARKT"),
++        ("BEISPIELMARKTCRED+DE98ZZZ09999999999MREF+M7SVWZ+KARTE 4711", "BEISPIELMARKT"),
++    ],
++)
++def test_sepa_profile_strips_sepa_fields(memo: str, token: str, tmp_path: pathlib.Path) -> None:
++    _write(tmp_path, "accounts.toml", SEPA_MAPPING)
++    result = normaliser.load(tmp_path).normalise(memo, GIROKONTO)
++    assert result.profile == "sepa"
++    assert result.token == token
++    for tag in SEPA_TAGS:
++        assert tag not in result.token
++
++
++def test_sepa_profile_ends_with_exactly_the_default_rules() -> None:
++    # A profile file has no include, so `sepa` repeats `default`'s rules; this keeps the
++    # copy from drifting when only one file is edited.
++    profiles = importlib.resources.files("autobook.pipeline") / "profiles"
++    default = tomllib.loads((profiles / "default.toml").read_text(encoding="utf-8"))
++    sepa = tomllib.loads((profiles / "sepa.toml").read_text(encoding="utf-8"))
++    assert default["rules"]
++    assert len(sepa["rules"]) > len(default["rules"])
++    assert sepa["rules"][-len(default["rules"]) :] == default["rules"]
++
++
++def test_sepa_profile_applies_only_to_the_mapped_account(tmp_path: pathlib.Path) -> None:
++    _write(tmp_path, "accounts.toml", SEPA_MAPPING)
++    loaded = normaliser.load(tmp_path)
++    memo = "EREF+ABC SVWZ+BEISPIELMARKT"
++    assert _text(loaded.normalise(memo, GIROKONTO)) == "BEISPIELMARKT"
++    unmapped = loaded.normalise(memo, corpus_builder.REVOLUT)
++    assert unmapped.profile == "default"
++    assert "EREF+" in unmapped.token
++
++
++# --- (c) override ----------------------------------------------------------------
++
++
++def test_user_profile_replaces_the_package_profile_of_the_same_name(
++    tmp_path: pathlib.Path,
++) -> None:
++    memo = "EREF+ABC SVWZ+BEISPIELMARKT KARTE 77"
++    mapped = _write(tmp_path / "mapped", "accounts.toml", SEPA_MAPPING)
++    package = normaliser.load(mapped).normalise(memo, GIROKONTO)
++    assert _text(package) == "BEISPIELMARKT"
++
++    user = _write(tmp_path / "user", "accounts.toml", SEPA_MAPPING)
++    # The user file strips the SVWZ tag only: whole-file replacement, no merge.
++    _write(user, "sepa.toml", "[[rules]]\npattern = '\\bSVWZ\\+'\n")
++    replaced = normaliser.load(user).normalise(memo, GIROKONTO)
++    assert _text(replaced) == "EREF+ABC BEISPIELMARKT KARTE 77"
++    assert replaced.token != package.token
++
++    # With the user file gone, the package profile applies again.
++    (user / "sepa.toml").unlink()
++    assert _text(normaliser.load(user).normalise(memo, GIROKONTO)) == "BEISPIELMARKT"
++
++
++def test_user_file_with_a_new_name_adds_a_profile(tmp_path: pathlib.Path) -> None:
++    _write(tmp_path, "shop.toml", "[[rules]]\npattern = '\\bFILIALE\\b'\n")
++    _write(
++        tmp_path,
++        "accounts.toml",
++        '[[accounts]]\npath = ["Aktiva", "Revolut"]\nprofile = "shop"\n',
++    )
++    result = normaliser.load(tmp_path).normalise(
++        "Beispielmarkt Filiale 12", corpus_builder.REVOLUT
++    )
++    assert result.profile == "shop"
++    assert _text(result) == "BEISPIELMARKT 12"
++
++
++# --- (d) version -----------------------------------------------------------------
++
++PROFILE = "[[rules]]\npattern = '\\bKARTE \\d+'\n\n[[rules]]\npattern = '\\bREF \\d+'\n"
++
++
++def _user_dir(
++    directory: pathlib.Path, profile: str = PROFILE, mapping: str = ""
++) -> pathlib.Path:
++    _write(directory, "shop.toml", profile)
++    _write(directory, "accounts.toml", mapping or SEPA_MAPPING)
++    return directory
++
++
++def test_version_has_the_documented_shape(tmp_path: pathlib.Path) -> None:
++    version = normaliser.load(tmp_path).version
++    assert re.fullmatch(rf"{normaliser.NORMALISER_VERSION}-[0-9a-f]{{12}}", version)
++
++
++def test_same_files_give_the_same_version_from_different_directories(
++    tmp_path: pathlib.Path,
++) -> None:
++    first = _user_dir(tmp_path / "first")
++    second = _user_dir(tmp_path / "second")
++    assert normaliser.load(first).version == normaliser.load(first).version
++    assert normaliser.load(first).version == normaliser.load(second).version
++
++
++def test_a_changed_rule_or_mapping_line_changes_the_version(tmp_path: pathlib.Path) -> None:
++    base = normaliser.load(_user_dir(tmp_path / "base")).version
++    rule = normaliser.load(
++        _user_dir(tmp_path / "rule", profile=PROFILE.replace("KARTE", "CARD"))
++    ).version
++    mapping = normaliser.load(
++        _user_dir(tmp_path / "mapping", mapping=SEPA_MAPPING.replace("sepa", "default"))
++    ).version
++    empty = normaliser.load(tmp_path / "absent").version
++    assert len({base, rule, mapping, empty}) == 4
++
++
++def test_rule_order_is_part_of_the_version(tmp_path: pathlib.Path) -> None:
++    swapped = "[[rules]]\npattern = '\\bREF \\d+'\n\n[[rules]]\npattern = '\\bKARTE \\d+'\n"
++    first = normaliser.load(_user_dir(tmp_path / "a")).version
++    second = normaliser.load(_user_dir(tmp_path / "b", profile=swapped)).version
++    assert first != second
++
++
++def test_every_result_carries_the_version_and_the_unchanged_raw_memo(
++    tmp_path: pathlib.Path,
++) -> None:
++    loaded = normaliser.load(_user_dir(tmp_path))
++    for memo in ("  Beispielmarkt   KARTE 12\tREF 7 ", "", "12345", "Müller & Söhne"):
++        result = loaded.normalise(memo, GIROKONTO)
++        assert result.version == loaded.version
++        assert result.raw_memo == memo
++
++
++# --- tokens: case, whitespace, empty ---------------------------------------------
++
++
++def test_token_is_upper_cased_and_whitespace_collapsed(tmp_path: pathlib.Path) -> None:
++    result = normaliser.load(tmp_path).normalise("  beispiel \t markt \n", GIROKONTO)
++    assert _text(result) == "BEISPIEL MARKT"
++
++
++def test_an_all_noise_memo_gives_an_empty_token(tmp_path: pathlib.Path) -> None:
++    result = normaliser.load(tmp_path).normalise("REF 123 05.03. 99", GIROKONTO)
++    assert _text(result) == ""
++
++
++# --- user directory resolution ---------------------------------------------------
++
++
++def test_default_directory_follows_xdg_config_home(
++    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _write(
++        tmp_path / "xdg" / "autobook" / "normaliser",
++        "default.toml",
++        "[[rules]]\npattern = '\\bMARKT\\b'\n",
++    )
++    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
++    result = normaliser.load().normalise("Beispiel Markt", GIROKONTO)
++    assert _text(result) == "BEISPIEL"
++
++
++def test_default_directory_falls_back_to_home_config(
++    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _write(
++        tmp_path / "home" / ".config" / "autobook" / "normaliser",
++        "default.toml",
++        "[[rules]]\npattern = '\\bMARKT\\b'\n",
++    )
++    monkeypatch.setenv("XDG_CONFIG_HOME", "")
++    monkeypatch.setenv("HOME", str(tmp_path / "home"))
++    assert _text(normaliser.load().normalise("Beispiel Markt", GIROKONTO)) == "BEISPIEL"
++
++
++def test_a_relative_xdg_config_home_is_ignored(
++    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    # The XDG spec: a relative value is invalid and ignored. Otherwise the profiles in
++    # effect would depend on the directory autobook was started from.
++    _write(
++        tmp_path / "home" / ".config" / "autobook" / "normaliser",
++        "default.toml",
++        "[[rules]]\npattern = '\\bMARKT\\b'\n",
++    )
++    _write(
++        tmp_path / "cwd" / "rel" / "autobook" / "normaliser",
++        "default.toml",
++        "[[rules]]\npattern = '\\bBEISPIEL\\b'\n",
++    )
++    monkeypatch.setenv("HOME", str(tmp_path / "home"))
++    monkeypatch.setenv("XDG_CONFIG_HOME", "rel")
++    monkeypatch.chdir(tmp_path / "cwd")
++    assert _text(normaliser.load().normalise("Beispiel Markt", GIROKONTO)) == "BEISPIEL"
++
++
++# --- NormaliserError -------------------------------------------------------------
++
++
++def test_normaliser_error_is_a_value_error() -> None:
++    assert issubclass(normaliser.NormaliserError, ValueError)
++
++
++@pytest.mark.parametrize(
++    ("name", "text"),
++    [
++        ("bad.toml", "[[rules]\n"),
++        ("bad.toml", "[[rules]]\npattern = '('\n"),
++        ("bad.toml", "[[rules]]\npattern = 5\n"),
++        ("bad.toml", "[[rules]]\npattern = 'X'\nflags = 'i'\n"),
++        ("bad.toml", "[[rules]]\n"),
++        ("bad.toml", "rule = []\n"),
++        ("bad.toml", "rules = 'X'\n"),
++        ("accounts.toml", '[[accounts]]\npath = "Aktiva:Girokonto"\nprofile = "default"\n'),
++        ("accounts.toml", '[[accounts]]\npath = []\nprofile = "default"\n'),
++        ("accounts.toml", '[[accounts]]\npath = ["Aktiva", ""]\nprofile = "default"\n'),
++        ("accounts.toml", '[[accounts]]\npath = ["Aktiva"]\nprofile = "missing"\n'),
++        ("accounts.toml", '[[accounts]]\npath = ["Aktiva"]\n'),
++        ("accounts.toml", '[[accounts]]\npath = ["Aktiva"]\nprofile = 1\n'),
++        ("accounts.toml", 'extra = 1\n[[accounts]]\npath = ["Aktiva"]\nprofile = "default"\n'),
++        (
++            "accounts.toml",
++            '[[accounts]]\npath = ["Aktiva"]\nprofile = "default"\n'
++            '[[accounts]]\npath = ["Aktiva"]\nprofile = "sepa"\n',
++        ),
++    ],
++)
++def test_bad_input_raises_normaliser_error(
++    name: str, text: str, tmp_path: pathlib.Path
++) -> None:
++    _write(tmp_path, name, text)
++    with pytest.raises(normaliser.NormaliserError):
++        normaliser.load(tmp_path)
++
++
++def test_error_names_the_file(tmp_path: pathlib.Path) -> None:
++    _write(tmp_path, "typo.toml", "[[rules]]\npatern = 'X'\n")
++    with pytest.raises(normaliser.NormaliserError, match=r"typo\.toml"):
++        normaliser.load(tmp_path)
++
++
++def test_an_unreadable_user_directory_raises(tmp_path: pathlib.Path) -> None:
++    # It exists but cannot be listed: its profiles and mapping must not be dropped
++    # silently, as if the directory were absent.
++    user = _write(tmp_path / "user", "accounts.toml", SEPA_MAPPING)
++    user.chmod(0o300)
++    try:
++        # Root can list it anyway; the test is only meaningful for a normal user.
++        assert not os.access(user, os.R_OK), "the test must not run as root"
++        with pytest.raises(normaliser.NormaliserError, match="cannot read"):
++            normaliser.load(user)
++    finally:
++        user.chmod(0o700)
++
++
++def test_a_user_directory_that_is_a_file_raises(tmp_path: pathlib.Path) -> None:
++    (tmp_path / "file").write_text("", encoding="utf-8")
++    with pytest.raises(normaliser.NormaliserError):
++        normaliser.load(tmp_path / "file")
++    with pytest.raises(normaliser.NormaliserError):
++        normaliser.load(tmp_path / "file" / "normaliser")
++
++
++def test_a_user_directory_behind_a_broken_link_raises(tmp_path: pathlib.Path) -> None:
++    # A dotfiles checkout that moved: the link is still there, its target is not. That
++    # is a configured directory that cannot be reached, not a missing one.
++    (tmp_path / "normaliser").symlink_to(tmp_path / "moved")
++    with pytest.raises(normaliser.NormaliserError, match="broken symlink"):
++        normaliser.load(tmp_path / "normaliser")
++    # The same for a broken link further up (`~/.config/autobook` itself linked).
++    (tmp_path / "autobook").symlink_to(tmp_path / "moved")
++    with pytest.raises(normaliser.NormaliserError, match="broken symlink"):
++        normaliser.load(tmp_path / "autobook" / "normaliser")
++
++
++def test_a_user_directory_behind_a_working_link_loads(tmp_path: pathlib.Path) -> None:
++    target = _write(tmp_path / "dotfiles", "accounts.toml", SEPA_MAPPING)
++    (tmp_path / "normaliser").symlink_to(target)
++    assert normaliser.load(tmp_path / "normaliser").version == normaliser.load(target).version
++    # A link to an existing parent with no normaliser/ under it is just a missing one.
++    (tmp_path / "autobook").symlink_to(tmp_path / "dotfiles")
++    absent = normaliser.load(tmp_path / "absent").version
++    assert normaliser.load(tmp_path / "autobook" / "normaliser").version == absent
++
++
++def test_a_broken_profile_link_raises_and_a_hidden_one_is_ignored(
++    tmp_path: pathlib.Path,
++) -> None:
++    # An editor's lock file (`.#name.toml`, a dangling link) is not a profile.
++    (tmp_path / ".#sepa.toml").symlink_to(tmp_path / "gone")
++    assert _text(normaliser.load(tmp_path).normalise("X", GIROKONTO)) == "X"
++    (tmp_path / "sepa.toml").symlink_to(tmp_path / "gone")
++    with pytest.raises(normaliser.NormaliserError, match=r"sepa\.toml"):
++        normaliser.load(tmp_path)
++
++
++def test_malformed_source_account_raises(tmp_path: pathlib.Path) -> None:
++    loaded = normaliser.load(tmp_path)
++    with pytest.raises(normaliser.NormaliserError):
++        loaded.normalise("X", ())
++    with pytest.raises(normaliser.NormaliserError):
++        loaded.normalise("X", ("Aktiva", ""))
+diff --git a/tests/test_skeleton.py b/tests/test_skeleton.py
+index d68b4f0..6c66245 100644
+--- a/tests/test_skeleton.py
++++ b/tests/test_skeleton.py
+@@ -16,6 +16,11 @@ import pytest
+ 
+ MINIMUM_MODULES = {"autobook.pipeline": 11, "autobook.book": 6}
+ 
++# Blocks that are no longer stubs. They skip the stub-shape assertions below (one
++# exported name, callable, raises NotImplementedError) and every other check still
++# covers them. Each build step adds its block here.
++IMPLEMENTED = {"autobook.pipeline.normaliser"}
++
+ 
+ def _modules(package: str) -> list[str]:
+     path = importlib.import_module(package).__path__
+@@ -42,6 +47,8 @@ def test_staging_is_a_top_level_block_not_part_of_the_pipeline() -> None:
+ 
+ def test_every_block_has_one_entry_point_that_is_not_implemented() -> None:
+     for name in _all_building_blocks():
++        if name in IMPLEMENTED:
++            continue
+         module: Any = importlib.import_module(name)
+         assert len(module.__all__) == 1, name
+         entry_point = getattr(module, module.__all__[0])

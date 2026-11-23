@@ -1,0 +1,37 @@
+feat: add package skeleton, versioned contracts and synthetic fixtures
+
+Lay down the code layout from architecture chapter 5 so each later build
+step changes behaviour behind a symbol that already exists, instead of
+adding new code its own tests import.
+
+- src/autobook/pipeline/ (11 modules), src/autobook/book/ (6 modules) and
+  a top-level src/autobook/staging.py, one module per building block. Each
+  exposes one entry point that raises NotImplementedError. None imports
+  gnucash, and `import autobook` stays as light as before.
+- autobook.contracts: the `corpus` and `coa` JSON contracts as frozen
+  dataclasses with parse and serialise. Every document carries its contract
+  name and an integer version (1). A reader rejects an unknown name or
+  version, money that is not a plain int of cents (float and bool are
+  refused), an account path that is not a list of components, unknown or
+  missing fields, and values outside a closed set (sign, provenance,
+  GnuCash account type). The same checks run when an object is built, so a
+  writer cannot produce a document a reader would refuse. Standard library
+  only.
+- Account paths are component lists, never separator-joined strings:
+  GnuCash takes the separator from a user preference outside the book, so a
+  joined string means different things on different machines.
+- tests/fixtures/synthetic/: a README with the synthetic-only rule, a
+  seeded corpus builder (near-duplicate memos and one planted novel
+  merchant on the latest date) and a coa.json matching the tree that
+  tests/book/synthetic_book.py builds.
+- .gitignore: ignore *.pdf inside the financial-data block, above the
+  synthetic-fixture un-ignore so synthetic PDFs stay committable.
+- Chapter 5 records the package layout and the contracts' wire shape.
+
+The hand-written synthetic XML book from the issue is dropped:
+tests/book/synthetic_book.py, added in
+2a4b8456537b220ff68351b0406b7939dc76a738, builds books through the
+bindings at test time. The live_paperless marker was already registered
+there.
+
+Fixes #22

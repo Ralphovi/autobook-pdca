@@ -1,0 +1,10 @@
+{
+  "mode": "new-pr",
+  "branch": "enhancement/23-normaliser-profiles-version",
+  "pr_url": "https://github.com/Ralphovi/autobook/pull/50",
+  "base": "main",
+  "repo": "Ralphovi/autobook",
+  "by": "Eduard Ralph",
+  "date": "2026-10-15",
+  "id_pending": false
+}

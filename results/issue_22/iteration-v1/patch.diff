@@ -1,0 +1,1556 @@
+diff --git a/.gitignore b/.gitignore
+index 17b7005..74e87aa 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -39,6 +39,7 @@ htmlcov/
+ *.mt940
+ *.sta
+ *.camt*.xml
++*.pdf
+ statements/
+ books/
+ 
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index 058c990..4717e10 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -8,10 +8,25 @@ tags:
+ ---
+ # 5. Building block view
+ 
+-> Living document. Describes the designed decomposition; package and module
+-> names are provisional until the code exists **[OPEN]**. Diagram source:
++> Living document. Describes the designed decomposition and the package layout
++> that implements it (below). Diagram source:
+ > [`diagrams/c4-container.mermaid`](diagrams/c4-container.mermaid).
+ 
++### Package layout
++
++All under `src/autobook/`, one module per building block. Each stub module sets
++`__all__` to the one name of its entry point.
++
++| Path | Block |
++|------|-------|
++| `contracts.py` | The versioned JSON contracts (section 5.1). Standard library only. |
++| `staging.py` | The staging store (section 5.1). Its own top-level block, because both processes use it. Standard library only. |
++| `pipeline/` | `statement_source`, `admission`, `normaliser`, `correlator`, `bill_matcher`, `classifier`, `model_adapter`, `disposition`, `batch_gate`, `review_file`, `trial` (section 5.2). Never imports `gnucash`. |
++| `book/` | `session`, `exporter`, `applier`, `readback`, `assertions`, `undo` (section 5.3). The only package that may import `gnucash`, per file, as each module needs it. |
++
++The launcher (section 5.4) is a shell script, not a Python module. `import
++autobook` does not import the subpackages.
++
+ ## 5.1 Three processes and one store
+ 
+ | Block | Runs as | May link libgnucash | Purpose |
+@@ -37,10 +52,32 @@ All communication between pipeline and book process is JSON on stdin/stdout or
+ in files under the staging directory. Each contract is versioned; widening one is
+ a documented change that updates this section in the same PR.
+ 
++Wire shape, implemented in `autobook.contracts`:
++
++- Every document is a JSON object with its `contract` name (`"corpus"`,
++  `"coa"`) and an integer `version`, starting at `1`. A reader accepts only a
++  name and version it knows, and rejects anything else with `ContractError`.
++- Money is a plain integer of cents. A float or a boolean is rejected.
++- An account is a **list of path components**, root account excluded, never a
++  separator-joined string. GnuCash takes the account separator from a user
++  preference outside the book (`.` in a headless session, often `:` on a
++  desktop), so a joined string would mean different things on different
++  machines. Nothing in the contracts joins or splits a path.
++- A missing or unknown field is rejected, as is a value outside a closed set.
++- `corpus` is `{"contract", "version", "rows"}`. A row has `raw_memo`,
++  `amount_cents` (the magnitude, an integer greater than zero), `sign`,
++  `source_account`, `destination_account`, `post_date` (`YYYY-MM-DD`) and
++  `provenance`. `sign` is `"out"` when the money leaves `source_account` and
++  `"in"` when it enters it; the kNN index is keyed by `(source_account, sign)`.
++  `provenance` is always `"observed"`: the contract refuses `corrected`.
++- `coa` is `{"contract", "version", "accounts"}`. An account has `path`, `type`
++  (GnuCash's account-type name), `placeholder`, `commodity`
++  (`{"namespace", "mnemonic"}`) and `fraction` (an integer greater than zero).
++
+ | Contract | Direction | Carries |
+ |----------|-----------|---------|
+ | `corpus` | book → pipeline | Two-split transactions: `(normalised-able raw memo, amount_cents, sign, source_account, destination_account, post_date)`, every one with provenance `observed`. Read-only session. `corrected` rows never come from the book; the pipeline adds them from staging. |
+-| `coa` | book → pipeline | The live account tree: full names, types, placeholder flags, commodities and their fractions. |
++| `coa` | book → pipeline | The live account tree: paths (component lists), types, placeholder flags, commodities and their fractions. |
+ | `existing` | book → pipeline | Autobook IDs already present in `num` (idempotency); per source account the transactions in a date window, for the `match_existing` search; and the **scheduled-transaction (SX) definitions** — template accounts, amounts, recurrence — so the pipeline can tell when a row falls on an SX occurrence. Read-only session. |
+ | `apply-in` | pipeline → book | Approved rows: `proposal_id`, disposition, source and destination (or split specification), `amount_cents`, the source account's commodity, date, description, optional `doc_link`, optional `match_guid`. |
+ | `apply-out` | book → pipeline | Per row `{proposal_id, tx_guid, status}`, where `applied` is reported only after a read-back has found the transaction; per batch the assertion results. |
+diff --git a/src/autobook/book/__init__.py b/src/autobook/book/__init__.py
+new file mode 100644
+index 0000000..c305821
+--- /dev/null
++++ b/src/autobook/book/__init__.py
+@@ -0,0 +1,5 @@
++"""The book process: every read from and write to a book (ch.5 section 5.3).
++
++Runs under the system Python, the only place `gnucash` can be imported. One module
++per building block. No module imports `gnucash` yet.
++"""
+diff --git a/src/autobook/book/applier.py b/src/autobook/book/applier.py
+new file mode 100644
+index 0000000..7327306
+--- /dev/null
++++ b/src/autobook/book/applier.py
+@@ -0,0 +1,19 @@
++"""Applier — building block of ch.5 section 5.3.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Book-process module. It does not import `gnucash` yet; the first per-file ruff
++exception arrives with the exporter.
++"""
++
++from __future__ import annotations
++
++__all__ = ["apply_rows"]
++
++
++def apply_rows() -> None:
++    """Entry point of the applier block."""
++    raise NotImplementedError
+diff --git a/src/autobook/book/assertions.py b/src/autobook/book/assertions.py
+new file mode 100644
+index 0000000..08eb5ff
+--- /dev/null
++++ b/src/autobook/book/assertions.py
+@@ -0,0 +1,19 @@
++"""Assertions — building block of ch.5 section 5.3.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Book-process module. It does not import `gnucash` yet; the first per-file ruff
++exception arrives with the exporter.
++"""
++
++from __future__ import annotations
++
++__all__ = ["check_assertions"]
++
++
++def check_assertions() -> None:
++    """Entry point of the assertions block."""
++    raise NotImplementedError
+diff --git a/src/autobook/book/exporter.py b/src/autobook/book/exporter.py
+new file mode 100644
+index 0000000..b50705b
+--- /dev/null
++++ b/src/autobook/book/exporter.py
+@@ -0,0 +1,19 @@
++"""Exporter — building block of ch.5 section 5.3.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Book-process module. It does not import `gnucash` yet; the first per-file ruff
++exception arrives with the exporter.
++"""
++
++from __future__ import annotations
++
++__all__ = ["export_book"]
++
++
++def export_book() -> None:
++    """Entry point of the exporter block."""
++    raise NotImplementedError
+diff --git a/src/autobook/book/readback.py b/src/autobook/book/readback.py
+new file mode 100644
+index 0000000..3ec7307
+--- /dev/null
++++ b/src/autobook/book/readback.py
+@@ -0,0 +1,19 @@
++"""Read-back — building block of ch.5 section 5.3.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Book-process module. It does not import `gnucash` yet; the first per-file ruff
++exception arrives with the exporter.
++"""
++
++from __future__ import annotations
++
++__all__ = ["read_back"]
++
++
++def read_back() -> None:
++    """Entry point of the read-back block."""
++    raise NotImplementedError
+diff --git a/src/autobook/book/session.py b/src/autobook/book/session.py
+new file mode 100644
+index 0000000..e0ef60d
+--- /dev/null
++++ b/src/autobook/book/session.py
+@@ -0,0 +1,19 @@
++"""Session manager — building block of ch.5 section 5.3.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Book-process module. It does not import `gnucash` yet; the first per-file ruff
++exception arrives with the exporter.
++"""
++
++from __future__ import annotations
++
++__all__ = ["open_session"]
++
++
++def open_session() -> None:
++    """Entry point of the session manager block."""
++    raise NotImplementedError
+diff --git a/src/autobook/book/undo.py b/src/autobook/book/undo.py
+new file mode 100644
+index 0000000..e81aeb2
+--- /dev/null
++++ b/src/autobook/book/undo.py
+@@ -0,0 +1,19 @@
++"""Undo — building block of ch.5 section 5.3.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Book-process module. It does not import `gnucash` yet; the first per-file ruff
++exception arrives with the exporter.
++"""
++
++from __future__ import annotations
++
++__all__ = ["undo_batch"]
++
++
++def undo_batch() -> None:
++    """Entry point of the undo block."""
++    raise NotImplementedError
+diff --git a/src/autobook/contracts.py b/src/autobook/contracts.py
+new file mode 100644
+index 0000000..39f4772
+--- /dev/null
++++ b/src/autobook/contracts.py
+@@ -0,0 +1,335 @@
++"""The versioned JSON contracts between the pipeline and the book process.
++
++Building block: the "JSON contracts" of ch.5 section 5.1
++(`docs/design/architecture/05-building-block-view.md`). This step defines the
++two book -> pipeline contracts the corpus export needs, ``corpus`` and ``coa``.
++``existing``, ``apply-in`` and ``apply-out`` arrive with the steps that use them.
++
++**Standard library only, and never ``gnucash``.** The pipeline venv and the book
++process's system Python both import this module.
++
++Wire shape. A document is a JSON object that carries its ``contract`` name and an
++integer ``version``; a reader accepts only a name and version it knows::
++
++    {"contract": "corpus", "version": 1, "rows": [...]}
++    {"contract": "coa", "version": 1, "accounts": [...]}
++
++Three rules hold for every contract, and ``parse_*`` rejects a document that
++breaks one with :class:`ContractError`:
++
++* money is a plain ``int`` of cents. A ``float`` and a ``bool`` (a subclass of
++  ``int`` in Python) are both refused;
++* an account is a non-empty list of non-empty path components. GnuCash's account
++  separator is a user preference outside the book, so nothing here joins or
++  splits a path on a separator character;
++* no field is missing, none is unknown, and closed-set values are checked.
++"""
++
++from __future__ import annotations
++
++import datetime
++import json
++import re
++from dataclasses import dataclass
++from typing import Any, Final, Literal, NoReturn
++
++__all__ = [
++    "COA_NAME",
++    "COA_VERSION",
++    "CORPUS_NAME",
++    "CORPUS_VERSION",
++    "CoaAccount",
++    "CoaContract",
++    "Commodity",
++    "ContractError",
++    "CorpusContract",
++    "CorpusRow",
++    "Sign",
++    "coa_from_json",
++    "coa_to_json",
++    "corpus_from_json",
++    "corpus_to_json",
++    "parse_coa",
++    "parse_corpus",
++    "serialise_coa",
++    "serialise_corpus",
++]
++
++CORPUS_NAME: Final = "corpus"
++CORPUS_VERSION: Final = 1
++COA_NAME: Final = "coa"
++COA_VERSION: Final = 1
++
++# Direction of the money relative to ``source_account``: "out" leaves it (a
++# payment), "in" enters it (a receipt). ``amount_cents`` is the magnitude, so the
++# direction lives here and the kNN index can be keyed by (source_account, sign).
++Sign = Literal["out", "in"]
++_SIGNS: Final[tuple[str, ...]] = ("out", "in")
++
++# The corpus comes from the book, so every row is observed; "corrected" rows are
++# added by the pipeline from staging and never travel over this contract.
++_PROVENANCE: Final = "observed"
++
++_ISO_DATE: Final = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
++
++
++class ContractError(ValueError):
++    """A contract document was not accepted."""
++
++
++@dataclass(frozen=True)
++class CorpusRow:
++    """One two-split transaction exported from the book."""
++
++    raw_memo: str
++    amount_cents: int
++    sign: Sign
++    source_account: tuple[str, ...]
++    destination_account: tuple[str, ...]
++    post_date: datetime.date
++    provenance: Literal["observed"] = "observed"
++
++
++@dataclass(frozen=True)
++class CorpusContract:
++    rows: tuple[CorpusRow, ...]
++
++
++@dataclass(frozen=True)
++class Commodity:
++    namespace: str
++    mnemonic: str
++
++
++@dataclass(frozen=True)
++class CoaAccount:
++    """One account of the live tree; ``path`` excludes the root account."""
++
++    path: tuple[str, ...]
++    type: str
++    placeholder: bool
++    commodity: Commodity
++    fraction: int
++
++
++@dataclass(frozen=True)
++class CoaContract:
++    accounts: tuple[CoaAccount, ...]
++
++
++# --- validation helpers ------------------------------------------------------------
++
++
++def _fail(where: str, message: str) -> NoReturn:
++    raise ContractError(f"{where}: {message}")
++
++
++def _mapping(value: object, where: str, keys: tuple[str, ...]) -> dict[str, Any]:
++    if not isinstance(value, dict):
++        _fail(where, f"expected a JSON object, got {type(value).__name__}")
++    found = set(value)
++    missing = [key for key in keys if key not in found]
++    unknown = sorted(str(key) for key in found - set(keys))
++    if missing:
++        _fail(where, f"missing field(s): {', '.join(missing)}")
++    if unknown:
++        _fail(where, f"unknown field(s): {', '.join(unknown)}")
++    return value
++
++
++def _header(document: object, name: str, version: int, body: str) -> dict[str, Any]:
++    mapping = _mapping(document, name, ("contract", "version", body))
++    if mapping["contract"] != name:
++        _fail(name, f"contract name is {mapping['contract']!r}, expected {name!r}")
++    found = mapping["version"]
++    # `type(...) is int` on purpose: True == 1 and 1.0 == 1, neither is a version.
++    if type(found) is not int or found != version:
++        _fail(name, f"unsupported version {found!r}; this code reads version {version}")
++    return mapping
++
++
++def _text(value: object, where: str, *, non_empty: bool = False) -> str:
++    if not isinstance(value, str):
++        _fail(where, f"expected a string, got {type(value).__name__}")
++    if non_empty and not value:
++        _fail(where, "must not be empty")
++    return value
++
++
++def _cents(value: object, where: str, *, minimum: int) -> int:
++    # bool is a subclass of int, so isinstance() would let True through.
++    if type(value) is not int:
++        _fail(where, f"expected an integer, got {type(value).__name__}")
++    if value < minimum:
++        _fail(where, f"must be at least {minimum}, got {value}")
++    return value
++
++
++def _flag(value: object, where: str) -> bool:
++    if type(value) is not bool:
++        _fail(where, f"expected true or false, got {type(value).__name__}")
++    return value
++
++
++def _path(value: object, where: str) -> tuple[str, ...]:
++    if not isinstance(value, list) or not value:
++        _fail(where, "an account is a non-empty list of path components")
++    return tuple(_text(part, f"{where}[{i}]", non_empty=True) for i, part in enumerate(value))
++
++
++def _date(value: object, where: str) -> datetime.date:
++    text = _text(value, where)
++    # fromisoformat() alone also takes "20260102" and "2026-W01-5" on 3.11+.
++    if not _ISO_DATE.fullmatch(text):
++        _fail(where, f"expected YYYY-MM-DD, got {text!r}")
++    try:
++        return datetime.date.fromisoformat(text)
++    except ValueError:
++        _fail(where, f"not a calendar date: {text!r}")
++
++
++def _list(value: object, where: str) -> list[Any]:
++    if not isinstance(value, list):
++        _fail(where, f"expected a JSON array, got {type(value).__name__}")
++    return value
++
++
++# --- corpus -----------------------------------------------------------------------
++
++_ROW_KEYS: Final = (
++    "raw_memo",
++    "amount_cents",
++    "sign",
++    "source_account",
++    "destination_account",
++    "post_date",
++    "provenance",
++)
++
++
++def parse_corpus(document: object) -> CorpusContract:
++    """Validate a decoded ``corpus`` document and return it as an object."""
++    body = _header(document, CORPUS_NAME, CORPUS_VERSION, "rows")
++    rows: list[CorpusRow] = []
++    for i, raw in enumerate(_list(body["rows"], "corpus.rows")):
++        where = f"corpus.rows[{i}]"
++        row = _mapping(raw, where, _ROW_KEYS)
++        sign = row["sign"]
++        if sign not in _SIGNS:
++            _fail(f"{where}.sign", f"expected one of {list(_SIGNS)}, got {sign!r}")
++        if row["provenance"] != _PROVENANCE:
++            _fail(
++                f"{where}.provenance",
++                f"the corpus contract accepts only {_PROVENANCE!r}, got {row['provenance']!r}",
++            )
++        rows.append(
++            CorpusRow(
++                raw_memo=_text(row["raw_memo"], f"{where}.raw_memo"),
++                amount_cents=_cents(row["amount_cents"], f"{where}.amount_cents", minimum=1),
++                sign=sign,
++                source_account=_path(row["source_account"], f"{where}.source_account"),
++                destination_account=_path(
++                    row["destination_account"], f"{where}.destination_account"
++                ),
++                post_date=_date(row["post_date"], f"{where}.post_date"),
++            )
++        )
++    return CorpusContract(rows=tuple(rows))
++
++
++def serialise_corpus(corpus: CorpusContract) -> dict[str, Any]:
++    """The canonical document for ``corpus``; ``parse_corpus`` reads it back."""
++    return {
++        "contract": CORPUS_NAME,
++        "version": CORPUS_VERSION,
++        "rows": [
++            {
++                "raw_memo": row.raw_memo,
++                "amount_cents": row.amount_cents,
++                "sign": row.sign,
++                "source_account": list(row.source_account),
++                "destination_account": list(row.destination_account),
++                "post_date": row.post_date.isoformat(),
++                "provenance": row.provenance,
++            }
++            for row in corpus.rows
++        ],
++    }
++
++
++def corpus_to_json(corpus: CorpusContract) -> str:
++    return json.dumps(serialise_corpus(corpus), ensure_ascii=False)
++
++
++def corpus_from_json(text: str) -> CorpusContract:
++    return parse_corpus(_decode(text, CORPUS_NAME))
++
++
++# --- coa --------------------------------------------------------------------------
++
++_ACCOUNT_KEYS: Final = ("path", "type", "placeholder", "commodity", "fraction")
++
++
++def parse_coa(document: object) -> CoaContract:
++    """Validate a decoded ``coa`` document and return it as an object."""
++    body = _header(document, COA_NAME, COA_VERSION, "accounts")
++    accounts: list[CoaAccount] = []
++    for i, raw in enumerate(_list(body["accounts"], "coa.accounts")):
++        where = f"coa.accounts[{i}]"
++        account = _mapping(raw, where, _ACCOUNT_KEYS)
++        commodity = _mapping(
++            account["commodity"], f"{where}.commodity", ("namespace", "mnemonic")
++        )
++        accounts.append(
++            CoaAccount(
++                path=_path(account["path"], f"{where}.path"),
++                type=_text(account["type"], f"{where}.type", non_empty=True),
++                placeholder=_flag(account["placeholder"], f"{where}.placeholder"),
++                commodity=Commodity(
++                    namespace=_text(
++                        commodity["namespace"], f"{where}.commodity.namespace", non_empty=True
++                    ),
++                    mnemonic=_text(
++                        commodity["mnemonic"], f"{where}.commodity.mnemonic", non_empty=True
++                    ),
++                ),
++                fraction=_cents(account["fraction"], f"{where}.fraction", minimum=1),
++            )
++        )
++    return CoaContract(accounts=tuple(accounts))
++
++
++def serialise_coa(coa: CoaContract) -> dict[str, Any]:
++    """The canonical document for ``coa``; ``parse_coa`` reads it back."""
++    return {
++        "contract": COA_NAME,
++        "version": COA_VERSION,
++        "accounts": [
++            {
++                "path": list(account.path),
++                "type": account.type,
++                "placeholder": account.placeholder,
++                "commodity": {
++                    "namespace": account.commodity.namespace,
++                    "mnemonic": account.commodity.mnemonic,
++                },
++                "fraction": account.fraction,
++            }
++            for account in coa.accounts
++        ],
++    }
++
++
++def coa_to_json(coa: CoaContract) -> str:
++    return json.dumps(serialise_coa(coa), ensure_ascii=False)
++
++
++def coa_from_json(text: str) -> CoaContract:
++    return parse_coa(_decode(text, COA_NAME))
++
++
++def _decode(text: str, name: str) -> object:
++    try:
++        return json.loads(text)
++    except ValueError as exc:
++        raise ContractError(f"{name}: not valid JSON: {exc}") from exc
+diff --git a/src/autobook/pipeline/__init__.py b/src/autobook/pipeline/__init__.py
+new file mode 100644
+index 0000000..4871951
+--- /dev/null
++++ b/src/autobook/pipeline/__init__.py
+@@ -0,0 +1,5 @@
++"""The pipeline: everything from statement to approved proposal (ch.5 section 5.2).
++
++Runs in a virtualenv with no GnuCash installed. **Nothing here may import
++`gnucash`**; the gate enforces it. One module per building block.
++"""
+diff --git a/src/autobook/pipeline/admission.py b/src/autobook/pipeline/admission.py
+new file mode 100644
+index 0000000..ada5dd5
+--- /dev/null
++++ b/src/autobook/pipeline/admission.py
+@@ -0,0 +1,18 @@
++"""Admission and dedup — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["admit_statement"]
++
++
++def admit_statement() -> None:
++    """Entry point of the admission and dedup block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/batch_gate.py b/src/autobook/pipeline/batch_gate.py
+new file mode 100644
+index 0000000..84cc38f
+--- /dev/null
++++ b/src/autobook/pipeline/batch_gate.py
+@@ -0,0 +1,18 @@
++"""Batch gate — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["check_batch"]
++
++
++def check_batch() -> None:
++    """Entry point of the batch gate block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/bill_matcher.py b/src/autobook/pipeline/bill_matcher.py
+new file mode 100644
+index 0000000..dcf35e4
+--- /dev/null
++++ b/src/autobook/pipeline/bill_matcher.py
+@@ -0,0 +1,18 @@
++"""Bill matcher — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["match_bills"]
++
++
++def match_bills() -> None:
++    """Entry point of the bill matcher block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/classifier.py b/src/autobook/pipeline/classifier.py
+new file mode 100644
+index 0000000..ef307d4
+--- /dev/null
++++ b/src/autobook/pipeline/classifier.py
+@@ -0,0 +1,18 @@
++"""Classifier — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["classify"]
++
++
++def classify() -> None:
++    """Entry point of the classifier block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/correlator.py b/src/autobook/pipeline/correlator.py
+new file mode 100644
+index 0000000..6d8360d
+--- /dev/null
++++ b/src/autobook/pipeline/correlator.py
+@@ -0,0 +1,18 @@
++"""Correlator — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["correlate_transfers"]
++
++
++def correlate_transfers() -> None:
++    """Entry point of the correlator block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/disposition.py b/src/autobook/pipeline/disposition.py
+new file mode 100644
+index 0000000..df3049f
+--- /dev/null
++++ b/src/autobook/pipeline/disposition.py
+@@ -0,0 +1,18 @@
++"""Disposition — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["disposition_rows"]
++
++
++def disposition_rows() -> None:
++    """Entry point of the disposition block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/model_adapter.py b/src/autobook/pipeline/model_adapter.py
+new file mode 100644
+index 0000000..ee4ad20
+--- /dev/null
++++ b/src/autobook/pipeline/model_adapter.py
+@@ -0,0 +1,18 @@
++"""Model adapter — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["ask_model"]
++
++
++def ask_model() -> None:
++    """Entry point of the model adapter block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/normaliser.py b/src/autobook/pipeline/normaliser.py
+new file mode 100644
+index 0000000..727082b
+--- /dev/null
++++ b/src/autobook/pipeline/normaliser.py
+@@ -0,0 +1,18 @@
++"""Normaliser — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["normalise"]
++
++
++def normalise() -> None:
++    """Entry point of the normaliser block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/review_file.py b/src/autobook/pipeline/review_file.py
+new file mode 100644
+index 0000000..7354ba1
+--- /dev/null
++++ b/src/autobook/pipeline/review_file.py
+@@ -0,0 +1,18 @@
++"""Review file — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["write_review_file"]
++
++
++def write_review_file() -> None:
++    """Entry point of the review file block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/statement_source.py b/src/autobook/pipeline/statement_source.py
+new file mode 100644
+index 0000000..da0c68c
+--- /dev/null
++++ b/src/autobook/pipeline/statement_source.py
+@@ -0,0 +1,18 @@
++"""Statement source — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["read_statements"]
++
++
++def read_statements() -> None:
++    """Entry point of the statement source block."""
++    raise NotImplementedError
+diff --git a/src/autobook/pipeline/trial.py b/src/autobook/pipeline/trial.py
+new file mode 100644
+index 0000000..c552f9d
+--- /dev/null
++++ b/src/autobook/pipeline/trial.py
+@@ -0,0 +1,18 @@
++"""Trial tooling (scenario 1) — building block of ch.5 section 5.2.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Stub: the entry point exists so later build steps have a symbol to change; it
++has no behaviour yet.
++
++Pipeline module: must never import `gnucash`.
++"""
++
++from __future__ import annotations
++
++__all__ = ["run_trial"]
++
++
++def run_trial() -> None:
++    """Entry point of the trial tooling (scenario 1) block."""
++    raise NotImplementedError
+diff --git a/src/autobook/staging.py b/src/autobook/staging.py
+new file mode 100644
+index 0000000..77a2c32
+--- /dev/null
++++ b/src/autobook/staging.py
+@@ -0,0 +1,19 @@
++"""Staging store — building block of ch.5 section 5.1.
++
++Design: `docs/design/architecture/05-building-block-view.md`.
++
++Its own top-level block, not part of the pipeline: the pipeline writes decisions
++to it, and the book process's read-back records `applied` and undo reads the
++GUID list. **Standard library only, and never `gnucash`.**
++
++Stub: the entry point exists so later build steps have a symbol to change.
++"""
++
++from __future__ import annotations
++
++__all__ = ["open_store"]
++
++
++def open_store() -> None:
++    """Entry point of the staging store block."""
++    raise NotImplementedError
+diff --git a/tests/fixtures/__init__.py b/tests/fixtures/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/fixtures/synthetic/README.md b/tests/fixtures/synthetic/README.md
+new file mode 100644
+index 0000000..e27246f
+--- /dev/null
++++ b/tests/fixtures/synthetic/README.md
+@@ -0,0 +1,23 @@
++# Synthetic fixtures
++
++Everything under this directory is **invented**. Every merchant name, memo,
++account name and amount is made up for the tests.
++
++The rule, from AGENTS.md ("Never collect or commit transactions"):
++
++- no real statement, memo, IBAN, document or correspondent name;
++- nothing derived from one, not even after normalising it;
++- amounts are integer cents, never floats.
++
++This is the one path `.gitignore` un-ignores for data-shaped files. If a fixture
++here looks like it came from a real statement, it does not belong here.
++
++## Contents
++
++| File | What it is |
++|------|------------|
++| `corpus_builder.py` | `build_corpus(seed)` returns a `corpus` contract object. The same seed gives an equal corpus; a different seed gives a different one. It holds near-duplicate memos and exactly one novel merchant, on the latest date. |
++| `coa.json` | A valid `coa` contract document for the same account tree that `tests/book/synthetic_book.py` builds (`ACCOUNTS`): 8 accounts, paths as component lists. |
++
++`coa.json` and `synthetic_book.ACCOUNTS` must stay in step. Comparing the two needs
++the GnuCash bindings, so it is done in the book-process tests, not here.
+diff --git a/tests/fixtures/synthetic/__init__.py b/tests/fixtures/synthetic/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/fixtures/synthetic/coa.json b/tests/fixtures/synthetic/coa.json
+new file mode 100644
+index 0000000..100c347
+--- /dev/null
++++ b/tests/fixtures/synthetic/coa.json
+@@ -0,0 +1,62 @@
++{
++  "contract": "coa",
++  "version": 1,
++  "accounts": [
++    {
++      "path": ["Aktiva"],
++      "type": "ASSET",
++      "placeholder": false,
++      "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++      "fraction": 100
++    },
++    {
++      "path": ["Aktiva", "Girokonto"],
++      "type": "BANK",
++      "placeholder": false,
++      "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++      "fraction": 100
++    },
++    {
++      "path": ["Aktiva", "Revolut"],
++      "type": "BANK",
++      "placeholder": false,
++      "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++      "fraction": 100
++    },
++    {
++      "path": ["Ausgaben"],
++      "type": "EXPENSE",
++      "placeholder": false,
++      "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++      "fraction": 100
++    },
++    {
++      "path": ["Ausgaben", "Lebensmittel"],
++      "type": "EXPENSE",
++      "placeholder": false,
++      "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++      "fraction": 100
++    },
++    {
++      "path": ["Ausgaben", "Miete"],
++      "type": "EXPENSE",
++      "placeholder": false,
++      "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++      "fraction": 100
++    },
++    {
++      "path": ["Einnahmen"],
++      "type": "INCOME",
++      "placeholder": false,
++      "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++      "fraction": 100
++    },
++    {
++      "path": ["Einnahmen", "Gehalt"],
++      "type": "INCOME",
++      "placeholder": false,
++      "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++      "fraction": 100
++    }
++  ]
++}
+diff --git a/tests/fixtures/synthetic/corpus_builder.py b/tests/fixtures/synthetic/corpus_builder.py
+new file mode 100644
+index 0000000..e42a366
+--- /dev/null
++++ b/tests/fixtures/synthetic/corpus_builder.py
+@@ -0,0 +1,101 @@
++"""Seeded builder for a synthetic ``corpus`` contract object.
++
++Every merchant, memo and amount is invented (see README.md). Amounts are integer
++cents. The account tree is the one `tests/book/synthetic_book.py` builds, written
++here as component tuples because that module imports `gnucash` and cannot be
++loaded on the host.
++"""
++
++from __future__ import annotations
++
++import datetime
++import random
++from typing import NamedTuple
++
++from autobook.contracts import CorpusContract, CorpusRow, Sign
++
++GIROKONTO = ("Aktiva", "Girokonto")
++REVOLUT = ("Aktiva", "Revolut")
++LEBENSMITTEL = ("Ausgaben", "Lebensmittel")
++MIETE = ("Ausgaben", "Miete")
++GEHALT = ("Einnahmen", "Gehalt")
++
++
++class Merchant(NamedTuple):
++    token: str
++    source: tuple[str, ...]
++    destination: tuple[str, ...]
++    sign: Sign
++    cents: tuple[int, int]  # inclusive range
++    per_month: tuple[int, int]  # inclusive range
++
++
++MERCHANTS: tuple[Merchant, ...] = (
++    Merchant("BEISPIELMARKT", GIROKONTO, LEBENSMITTEL, "out", (1500, 9500), (2, 4)),
++    Merchant("MUSTERBAECKEREI", GIROKONTO, LEBENSMITTEL, "out", (300, 1800), (2, 4)),
++    Merchant("TESTHOF GEMUESE", REVOLUT, LEBENSMITTEL, "out", (800, 4200), (1, 2)),
++    Merchant("MUSTER HAUSVERWALTUNG", GIROKONTO, MIETE, "out", (75000, 75000), (1, 1)),
++    Merchant("BEISPIEL ARBEITGEBER GMBH", GIROKONTO, GEHALT, "in", (240000, 260000), (1, 1)),
++)
++
++# Occurs exactly once, on the latest date, so a rolling-origin backtest sees it
++# only in the final month.
++NOVEL_MERCHANT = "NEUHEIM KIOSK"
++
++FIRST_MONTH = datetime.date(2025, 1, 1)
++MONTHS = 12
++# Regular rows fall on days 1-27; the novel row takes day 28 of the last month, a
++# date no other row has.
++LAST_REGULAR_DAY = 27
++NOVEL_DAY = 28
++
++# The kind of noise the normaliser strips: reference and card fragments, sequence
++# numbers, dates. {n} is a number, {d} a day, {m} a month.
++NOISE = (
++    "SAGT DANKE {n}",
++    "KARTE {n} {d:02d}.{m:02d}.",
++    "REF {n}",
++    "NR. {n}",
++    "{d:02d}.{m:02d}. {n}",
++    "",
++)
++
++
++def _month(index: int) -> tuple[int, int]:
++    zero_based = FIRST_MONTH.month - 1 + index
++    return FIRST_MONTH.year + zero_based // 12, zero_based % 12 + 1
++
++
++def build_corpus(seed: int) -> CorpusContract:
++    """Return a synthetic corpus; the same ``seed`` always gives an equal one."""
++    rng = random.Random(seed)  # noqa: S311  # synthetic data, not a security context
++    rows: list[CorpusRow] = []
++    for index in range(MONTHS):
++        year, month = _month(index)
++        for merchant in MERCHANTS:
++            for _ in range(rng.randint(*merchant.per_month)):
++                day = rng.randint(1, LAST_REGULAR_DAY)
++                noise = rng.choice(NOISE).format(n=rng.randint(100, 99999), d=day, m=month)
++                rows.append(
++                    CorpusRow(
++                        raw_memo=f"{merchant.token} {noise}".strip(),
++                        amount_cents=rng.randint(*merchant.cents),
++                        sign=merchant.sign,
++                        source_account=merchant.source,
++                        destination_account=merchant.destination,
++                        post_date=datetime.date(year, month, day),
++                    )
++                )
++    year, month = _month(MONTHS - 1)
++    rows.append(
++        CorpusRow(
++            raw_memo=f"{NOVEL_MERCHANT} {rng.randint(100, 99999)}",
++            amount_cents=rng.randint(200, 2500),
++            sign="out",
++            source_account=GIROKONTO,
++            destination_account=LEBENSMITTEL,
++            post_date=datetime.date(year, month, NOVEL_DAY),
++        )
++    )
++    rows.sort(key=lambda row: (row.post_date, row.raw_memo, row.amount_cents))
++    return CorpusContract(rows=tuple(rows))
+diff --git a/tests/test_contracts.py b/tests/test_contracts.py
+new file mode 100644
+index 0000000..69fb42d
+--- /dev/null
++++ b/tests/test_contracts.py
+@@ -0,0 +1,289 @@
++"""The `corpus` and `coa` contracts: round trip, version check, integer money.
++
++`autobook.contracts` is loaded inside each test (via `_contracts()`), never at
++module scope, so a tree without it fails these tests instead of failing to
++collect them.
++"""
++
++from __future__ import annotations
++
++import copy
++import datetime
++import importlib
++import json
++from typing import Any
++
++import pytest
++
++
++def _contracts() -> Any:
++    return importlib.import_module("autobook.contracts")
++
++
++def corpus_document() -> dict[str, Any]:
++    return {
++        "contract": "corpus",
++        "version": 1,
++        "rows": [
++            {
++                "raw_memo": "BEISPIELMARKT SAGT DANKE 4711",
++                "amount_cents": 4290,
++                "sign": "out",
++                "source_account": ["Aktiva", "Girokonto"],
++                "destination_account": ["Ausgaben", "Lebensmittel"],
++                "post_date": "2026-01-02",
++                "provenance": "observed",
++            },
++            {
++                "raw_memo": "BEISPIEL ARBEITGEBER GMBH GEHALT",
++                "amount_cents": 250000,
++                "sign": "in",
++                "source_account": ["Aktiva", "Girokonto"],
++                "destination_account": ["Einnahmen", "Gehalt"],
++                "post_date": "2026-01-28",
++                "provenance": "observed",
++            },
++        ],
++    }
++
++
++def coa_document() -> dict[str, Any]:
++    return {
++        "contract": "coa",
++        "version": 1,
++        "accounts": [
++            {
++                "path": ["Aktiva", "Girokonto"],
++                "type": "BANK",
++                "placeholder": False,
++                "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++                "fraction": 100,
++            },
++            {
++                "path": ["Ausgaben"],
++                "type": "EXPENSE",
++                "placeholder": True,
++                "commodity": {"namespace": "CURRENCY", "mnemonic": "EUR"},
++                "fraction": 100,
++            },
++        ],
++    }
++
++
++def _parse(name: str, document: object) -> Any:
++    return getattr(_contracts(), f"parse_{name}")(document)
++
++
++def _serialise(name: str, contract: object) -> Any:
++    return getattr(_contracts(), f"serialise_{name}")(contract)
++
++
++DOCUMENTS = {"corpus": corpus_document, "coa": coa_document}
++BODY_KEY = {"corpus": "rows", "coa": "accounts"}
++
++
++def _with(name: str, mutate: Any) -> dict[str, Any]:
++    document = DOCUMENTS[name]()
++    mutate(document)
++    return document
++
++
++def _row(document: dict[str, Any], key: str, value: object) -> None:
++    document["rows"][0][key] = value
++
++
++def _account(document: dict[str, Any], key: str, value: object) -> None:
++    document["accounts"][0][key] = value
++
++
++# --- (a) round trip ----------------------------------------------------------------
++
++
++@pytest.mark.parametrize("name", ["corpus", "coa"])
++def test_canonical_document_serialises_back_to_itself(name: str) -> None:
++    document = DOCUMENTS[name]()
++    assert _serialise(name, _parse(name, copy.deepcopy(document))) == document
++
++
++def test_corpus_object_round_trips_through_dict_and_json_text() -> None:
++    contracts = _contracts()
++    contract = contracts.CorpusContract(
++        rows=(
++            contracts.CorpusRow(
++                raw_memo="MUSTERBAECKEREI REF 17",
++                amount_cents=420,
++                sign="out",
++                source_account=("Aktiva", "Revolut"),
++                destination_account=("Ausgaben", "Lebensmittel"),
++                post_date=datetime.date(2026, 3, 9),
++            ),
++        )
++    )
++    assert contracts.parse_corpus(contracts.serialise_corpus(contract)) == contract
++    assert contracts.corpus_from_json(contracts.corpus_to_json(contract)) == contract
++
++
++def test_coa_object_round_trips_through_dict_and_json_text() -> None:
++    contracts = _contracts()
++    contract = contracts.CoaContract(
++        accounts=(
++            contracts.CoaAccount(
++                path=("Einnahmen", "Gehalt"),
++                type="INCOME",
++                placeholder=False,
++                commodity=contracts.Commodity(namespace="CURRENCY", mnemonic="EUR"),
++                fraction=100,
++            ),
++        )
++    )
++    assert contracts.parse_coa(contracts.serialise_coa(contract)) == contract
++    assert contracts.coa_from_json(contracts.coa_to_json(contract)) == contract
++
++
++@pytest.mark.parametrize("name", ["corpus", "coa"])
++def test_canonical_json_text_parses_and_reserialises(name: str) -> None:
++    contracts = _contracts()
++    text = json.dumps(DOCUMENTS[name]())
++    contract = getattr(contracts, f"{name}_from_json")(text)
++    assert json.loads(getattr(contracts, f"{name}_to_json")(contract)) == DOCUMENTS[name]()
++
++
++def test_account_path_is_kept_as_components_not_split_on_a_separator() -> None:
++    document = corpus_document()
++    document["rows"][0]["source_account"] = ["Aktiva:Girokonto"]
++    parsed = _parse("corpus", document)
++    assert parsed.rows[0].source_account == ("Aktiva:Girokonto",)
++    assert _serialise("corpus", parsed) == document
++
++
++# --- (b) unknown contract name or version ------------------------------------------
++
++
++@pytest.mark.parametrize("name", ["corpus", "coa"])
++@pytest.mark.parametrize("version", [0, 2, -1, 1.0, True, "1", None])
++def test_unknown_version_is_rejected(name: str, version: object) -> None:
++    document = DOCUMENTS[name]()
++    document["version"] = version
++    with pytest.raises(_contracts().ContractError):
++        _parse(name, document)
++
++
++@pytest.mark.parametrize("name", ["corpus", "coa"])
++def test_missing_version_is_rejected(name: str) -> None:
++    document = DOCUMENTS[name]()
++    del document["version"]
++    with pytest.raises(_contracts().ContractError):
++        _parse(name, document)
++
++
++@pytest.mark.parametrize("name", ["corpus", "coa"])
++def test_other_contract_name_is_rejected(name: str) -> None:
++    other = "coa" if name == "corpus" else "corpus"
++    document = DOCUMENTS[name]()
++    document["contract"] = other
++    with pytest.raises(_contracts().ContractError):
++        _parse(name, document)
++
++
++def test_contract_error_is_a_value_error() -> None:
++    assert issubclass(_contracts().ContractError, ValueError)
++
++
++@pytest.mark.parametrize("name", ["corpus", "coa"])
++def test_malformed_json_text_is_a_contract_error(name: str) -> None:
++    contracts = _contracts()
++    with pytest.raises(contracts.ContractError):
++        getattr(contracts, f"{name}_from_json")("{not json")
++
++
++# --- (c) integer-only money --------------------------------------------------------
++
++
++@pytest.mark.parametrize("amount", [12.5, 1250.0, True, "1250", None, 0, -1250])
++def test_corpus_rejects_a_non_integer_or_non_positive_amount(amount: object) -> None:
++    document = _with("corpus", lambda d: _row(d, "amount_cents", amount))
++    with pytest.raises(_contracts().ContractError):
++        _parse("corpus", document)
++
++
++@pytest.mark.parametrize("fraction", [100.0, 12.5, True, "100", None, 0, -100])
++def test_coa_rejects_a_non_integer_or_non_positive_fraction(fraction: object) -> None:
++    document = _with("coa", lambda d: _account(d, "fraction", fraction))
++    with pytest.raises(_contracts().ContractError):
++        _parse("coa", document)
++
++
++# --- the rest of the parse rules ---------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "path",
++    ["Aktiva:Girokonto", [], [""], ["Aktiva", ""], ["Aktiva", 3], None],
++)
++@pytest.mark.parametrize("field", ["source_account", "destination_account"])
++def test_corpus_rejects_an_account_that_is_not_a_component_list(
++    field: str, path: object
++) -> None:
++    document = _with("corpus", lambda d: _row(d, field, path))
++    with pytest.raises(_contracts().ContractError):
++        _parse("corpus", document)
++
++
++@pytest.mark.parametrize("path", ["Aktiva:Girokonto", [], [""], None])
++def test_coa_rejects_a_path_that_is_not_a_component_list(path: object) -> None:
++    document = _with("coa", lambda d: _account(d, "path", path))
++    with pytest.raises(_contracts().ContractError):
++        _parse("coa", document)
++
++
++@pytest.mark.parametrize("sign", ["debit", "OUT", "", 1, None])
++def test_corpus_rejects_a_sign_outside_the_closed_set(sign: object) -> None:
++    document = _with("corpus", lambda d: _row(d, "sign", sign))
++    with pytest.raises(_contracts().ContractError):
++        _parse("corpus", document)
++
++
++@pytest.mark.parametrize("provenance", ["corrected", "", None])
++def test_corpus_accepts_only_observed_provenance(provenance: object) -> None:
++    document = _with("corpus", lambda d: _row(d, "provenance", provenance))
++    with pytest.raises(_contracts().ContractError):
++        _parse("corpus", document)
++
++
++@pytest.mark.parametrize(
++    "date", ["20260102", "2026-W01-5", "2026-13-01", "2026-02-30", 20260102]
++)
++def test_corpus_rejects_a_post_date_that_is_not_an_iso_calendar_date(date: object) -> None:
++    document = _with("corpus", lambda d: _row(d, "post_date", date))
++    with pytest.raises(_contracts().ContractError):
++        _parse("corpus", document)
++
++
++@pytest.mark.parametrize("name", ["corpus", "coa"])
++def test_missing_and_unknown_fields_are_rejected(name: str) -> None:
++    key = BODY_KEY[name]
++    missing = DOCUMENTS[name]()
++    del missing[key][0][next(iter(missing[key][0]))]
++    unknown = DOCUMENTS[name]()
++    unknown[key][0]["extra"] = 1
++    top_level = DOCUMENTS[name]()
++    top_level["extra"] = 1
++    for document in (missing, unknown, top_level):
++        with pytest.raises(_contracts().ContractError):
++            _parse(name, document)
++
++
++@pytest.mark.parametrize("name", ["corpus", "coa"])
++@pytest.mark.parametrize("document", [None, [], "corpus", 1])
++def test_a_non_object_document_is_rejected(name: str, document: object) -> None:
++    with pytest.raises(_contracts().ContractError):
++        _parse(name, document)
++
++
++def test_coa_rejects_a_non_boolean_placeholder_and_a_malformed_commodity() -> None:
++    bad_placeholder = _with("coa", lambda d: _account(d, "placeholder", 0))
++    bad_commodity = _with("coa", lambda d: _account(d, "commodity", "EUR"))
++    empty_mnemonic = _with("coa", lambda d: d["accounts"][0]["commodity"].update(mnemonic=""))
++    for document in (bad_placeholder, bad_commodity, empty_mnemonic):
++        with pytest.raises(_contracts().ContractError):
++            _parse("coa", document)
+diff --git a/tests/test_skeleton.py b/tests/test_skeleton.py
+new file mode 100644
+index 0000000..de96a3b
+--- /dev/null
++++ b/tests/test_skeleton.py
+@@ -0,0 +1,58 @@
++"""The package skeleton: one importable stub per building block of ch.5.
++
++Modules are discovered with `pkgutil`, not named, so a missing module shows up
++as a count below the minimum. Everything is loaded inside the test body.
++"""
++
++from __future__ import annotations
++
++import importlib
++import pkgutil
++import sys
++from typing import Any
++
++import pytest
++
++MINIMUM_MODULES = {"autobook.pipeline": 11, "autobook.book": 6}
++
++
++def _modules(package: str) -> list[str]:
++    path = importlib.import_module(package).__path__
++    return sorted(f"{package}.{info.name}" for info in pkgutil.iter_modules(path))
++
++
++def _all_building_blocks() -> list[str]:
++    blocks = ["autobook.staging"]
++    for package in MINIMUM_MODULES:
++        blocks.extend(_modules(package))
++    return blocks
++
++
++@pytest.mark.parametrize("package", sorted(MINIMUM_MODULES))
++def test_package_has_one_module_per_building_block(package: str) -> None:
++    assert len(_modules(package)) >= MINIMUM_MODULES[package]
++
++
++def test_staging_is_a_top_level_block_not_part_of_the_pipeline() -> None:
++    assert "autobook.staging" in _all_building_blocks()
++    assert "autobook.pipeline.staging" not in _modules("autobook.pipeline")
++
++
++def test_every_block_has_one_entry_point_that_is_not_implemented() -> None:
++    for name in _all_building_blocks():
++        module: Any = importlib.import_module(name)
++        assert len(module.__all__) == 1, name
++        entry_point = getattr(module, module.__all__[0])
++        assert callable(entry_point), name
++        with pytest.raises(NotImplementedError):
++            entry_point()
++
++
++def test_building_blocks_and_contracts_do_not_import_gnucash() -> None:
++    for name in _all_building_blocks():
++        importlib.import_module(name)
++    importlib.import_module("autobook.contracts")
++    assert "gnucash" not in sys.modules, (
++        "a building block or the contracts pulled in the gnucash bindings — only "
++        "the book process may import them, and no module does yet. See AGENTS.md."
++    )
+diff --git a/tests/test_synthetic_fixtures.py b/tests/test_synthetic_fixtures.py
+new file mode 100644
+index 0000000..26ffe2b
+--- /dev/null
++++ b/tests/test_synthetic_fixtures.py
+@@ -0,0 +1,101 @@
++"""The synthetic fixtures: a seeded corpus builder and a `coa.json` document.
++
++The builder and `autobook.contracts` are loaded inside each test, never at module
++scope.
++"""
++
++from __future__ import annotations
++
++import importlib
++import json
++from collections import defaultdict
++from pathlib import Path
++from typing import Any
++
++SYNTHETIC = Path(__file__).parent / "fixtures" / "synthetic"
++SEEDS = (0, 1, 42)
++
++
++def _builder() -> Any:
++    return importlib.import_module("tests.fixtures.synthetic.corpus_builder")
++
++
++def _contracts() -> Any:
++    return importlib.import_module("autobook.contracts")
++
++
++def test_same_seed_gives_an_equal_corpus_and_another_seed_a_different_one() -> None:
++    build = _builder().build_corpus
++    assert build(7) == build(7)
++    assert build(7) != build(8)
++
++
++def test_corpus_has_near_duplicate_memos_for_the_same_merchant() -> None:
++    builder = _builder()
++    for seed in SEEDS:
++        memos: dict[str, set[str]] = defaultdict(set)
++        for row in builder.build_corpus(seed).rows:
++            for merchant in builder.MERCHANTS:
++                if row.raw_memo.startswith(merchant.token):
++                    memos[merchant.token].add(row.raw_memo)
++        assert set(memos) == {merchant.token for merchant in builder.MERCHANTS}
++        assert all(len(variants) >= 3 for variants in memos.values()), seed
++
++
++def test_corpus_has_exactly_one_novel_merchant_row_on_the_latest_date() -> None:
++    builder = _builder()
++    for seed in SEEDS:
++        rows = builder.build_corpus(seed).rows
++        novel = [row for row in rows if builder.NOVEL_MERCHANT in row.raw_memo]
++        latest = max(row.post_date for row in rows)
++        assert len(novel) == 1, seed
++        assert novel[0].post_date == latest, seed
++        assert [row.post_date for row in rows].count(latest) == 1, seed
++        # the final month also holds ordinary rows, so the backtest has an index
++        assert any(
++            row.post_date.month == latest.month and row.post_date != latest for row in rows
++        ), seed
++
++
++def test_corpus_rows_are_integer_cents_observed_and_free_of_iban_shapes() -> None:
++    for seed in SEEDS:
++        for row in _builder().build_corpus(seed).rows:
++            assert type(row.amount_cents) is int
++            assert row.amount_cents > 0
++            assert row.provenance == "observed"
++            assert not any(
++                token[:2].isalpha() and token[2:4].isdigit() and len(token) >= 15
++                for token in row.raw_memo.split()
++            )
++
++
++def test_corpus_round_trips_through_the_contract() -> None:
++    contracts = _contracts()
++    corpus = _builder().build_corpus(3)
++    document = contracts.serialise_corpus(corpus)
++    assert contracts.parse_corpus(document) == corpus
++    assert contracts.corpus_from_json(json.dumps(document)) == corpus
++    assert contracts.serialise_corpus(contracts.parse_corpus(document)) == document
++
++
++def test_coa_json_is_a_valid_coa_document_for_the_synthetic_book_tree() -> None:
++    contracts = _contracts()
++    document = json.loads((SYNTHETIC / "coa.json").read_text(encoding="utf-8"))
++    coa = contracts.parse_coa(document)
++    assert contracts.serialise_coa(coa) == document
++    assert [(a.path, a.type) for a in coa.accounts] == [
++        (("Aktiva",), "ASSET"),
++        (("Aktiva", "Girokonto"), "BANK"),
++        (("Aktiva", "Revolut"), "BANK"),
++        (("Ausgaben",), "EXPENSE"),
++        (("Ausgaben", "Lebensmittel"), "EXPENSE"),
++        (("Ausgaben", "Miete"), "EXPENSE"),
++        (("Einnahmen",), "INCOME"),
++        (("Einnahmen", "Gehalt"), "INCOME"),
++    ]
++    assert all(
++        not a.placeholder
++        and (a.commodity.namespace, a.commodity.mnemonic) == ("CURRENCY", "EUR")
++        and a.fraction == 100
++        for a in coa.accounts
++    )

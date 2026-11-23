@@ -1,0 +1,28 @@
+feat(classifier): kNN index that proposes an account or abstains
+
+Add the k-nearest-neighbour tier of the classifier. Given a normalised
+memo, it looks up the user's own past bookings for the same source account
+and direction and proposes one destination account, but only when two
+independent checks pass: the closest past memo is close enough, and the
+recency-weighted vote among the nearest memos has a clear winner. If
+either check fails it proposes nothing and says which one failed, so a
+memo it has never seen, or one booked two different ways, falls through
+instead of being guessed.
+
+Details that shape what the backtest will measure:
+
+- Text in a memo that history never contained counts toward its distance,
+  so a known merchant name plus unknown words is not an exact match.
+- Every row tied with the 15th-closest distance votes, so when a payee's
+  booking changed, the recent rows are weighed instead of input order
+  picking the oldest ones. The result does not depend on row order.
+- A query can leave one row out (for leave-one-out backtesting). That row
+  is removed from the vote and from the query's term weights; naming a
+  row the partition does not hold is an error, not a silent no-op.
+- Only observed or corrected rows, all from one normaliser version, can
+  enter the index; anything else raises instead of being dropped.
+
+scikit-learn becomes the first runtime dependency. Builds on the
+normaliser from 6b5a99da00cca2046e5cd86ea521c632d5596721.
+
+Fixes #24

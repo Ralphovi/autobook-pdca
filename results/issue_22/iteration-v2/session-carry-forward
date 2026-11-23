@@ -1,0 +1,4 @@
+Keep the design, scope and everything else in the patch unchanged; fix only the one remaining adversarial finding, with a test:
+1. src/autobook/contracts.py:178 — the coa account `type` closed-set check (`self.type not in ACCOUNT_TYPES`) hashes the value before checking it is a string, so a JSON array/object `type` (e.g. ["BANK"], {}, {"x": 1}) raises TypeError instead of ContractError, through both parse_coa and coa_from_json and on direct construction. Validate with `_text(self.type, "type")` before the membership test so every malformed type raises ContractError.
+2. Add ["BANK"] and {} (array and object) cases to the non-string `type` parametrize list in tests/test_contracts.py (~:324), covering parsing (document and JSON text) and direct construction.
+Do not re-open the size question: the 31 files are mostly 18 one-pattern stubs; the slice stays as one.
