@@ -1,0 +1,31 @@
+feat(normaliser): turn bank memos into merchant tokens via profiles
+
+Autobook could not yet clean a raw bank memo: the normaliser was a stub
+that raised NotImplementedError, so nothing downstream (the kNN index,
+the backtest) had a stable merchant token to work with.
+
+The normaliser now reduces a memo to its merchant name using named
+profiles. Two ship with the package: "default", which strips card and
+reference fragments, dates, times and stray digits, and "sepa", which
+extends "default" and handles the 15 SEPA field tags. Reference, amount,
+IBAN and BIC values are dropped; the purpose text, the creditor ID and
+the ultimate debtor/creditor names are kept, because they are what tells
+two merchants apart.
+
+Users can override or add profiles as TOML files in
+$XDG_CONFIG_HOME/autobook/normaliser/ and map source accounts to
+profiles in accounts.toml there; unmapped accounts use "default". Bad
+files fail loudly at load, never as a rule that silently does nothing.
+
+Every result carries Normaliser.version: the code's NORMALISER_VERSION
+plus a digest of the effective profiles, the account mapping and the
+Unicode database version. Any change that can alter a token changes the
+version, so vectors built from two different normalisations cannot be
+mixed unnoticed. This string, not the bare integer, is the value to
+record with vectors and in the version tuple.
+
+Chapters 5.2 and 8.8 of the architecture docs describe the profile
+format and user directory, and the one SEPA sentence in draft proposal
+0001 is corrected to match.
+
+Fixes #23

@@ -1,0 +1,26 @@
+# Adversarial review — issue 23 / normaliser-profiles-version (round 3)
+
+**Verdict: I could not refute the fix as briefed.** The red→green proof holds. The two items carried forward from round 2 (dangling directory symlink, relative `XDG_CONFIG_HOME`) are closed. What remains are scope and design points for the human. None is a builder defect against this brief.
+
+## Evidence: attempted, could not refute
+
+- `gate-logs/C4-verify.log:12-13,1292-1294`: green 53/53, red 48 of 53 failed with 0 collection errors. Every red failure is `AttributeError: ... no attribute 'load'` raised inside a test body, because `tests/test_normaliser.py:17` imports the module, not the new names. The 5 that pass on red are the `tests/test_skeleton.py` tests, which the stub also satisfies. Every normaliser test calls the production `normaliser.load(...)`; none uses a copy of the logic. `test_sepa_profile_ends_with_exactly_the_default_rules` reads the shipped TOML files, which the red leg removes, so it goes red for the right reason.
+- Re-ran the production loader in this sandbox (Python 3.14.4, `target/src` on the path). Adjacent tags (`EREF+X9MREF+...`), lower-case input, tags with an empty value at the end (`EREF+`), multi-line memos, a dangling link to the directory and to a parent, a relative `XDG_CONFIG_HOME`, and loading the same files from two different directories all behave as the brief says. The version is the same across directories and changes when one rule, the rule order or one mapping line changes (`src/autobook/pipeline/normaliser.py:269-278`).
+- Root check: `tests/test_normaliser.py` `test_an_unreadable_user_directory_raises` fails rather than skips when run as root. `.github/workflows/ci.yml:34,66` run on `ubuntu-latest` as the non-root `runner` user, so this does not break CI. Not raised.
+
+## Findings
+
+- NEEDS-HUMAN [human] — `src/autobook/pipeline/profiles/sepa.toml:10`: the shipped `sepa` profile only knows the five tags the brief names. Other common MT940 field-86 tags (MT940 is the German bank statement export format) pass into the token unchanged. Checked against the production loader with `Aktiva/Girokonto` mapped to `sepa`:
+  - `SVWZ+BEISPIELMARKT KREF+123` gives `BEISPIELMARKT KREF+`.
+  - `EREF+X SVWZ+BEISPIELMARKT ABWE+ERFUNDEN` gives `BEISPIELMARKT ABWE+ERFUNDEN`, so a payee name stays in the token.
+  - `SVWZ+BEISPIELMARKT IBAN+DE00ZZZ BIC+TESTDEFF` gives `BEISPIELMARKT IBAN+DE00ZZZ BIC+TESTDEFF`.
+
+  The IBAN case falls under the rubric's *Privacy* class ("a counterparty IBAN in shareable data") once #24 stores tokens in the index. A card-payment purpose such as `SVWZ+BEISPIELMARKT//MUENCHEN/DE 2025-03-05T10:11:12` gives `BEISPIELMARKT//MUENCHEN/DE - -05T10: :`. That token changes with every payment, so the kNN index (#24) never finds a neighbour for it. The brief and ch.5 (`docs/design/architecture/05-building-block-view.md:134`) fix the scope at five tags, so this is not a builder slip. A human should decide whether to widen `sepa` now (`KREF+`, `DEBT+`, `ABWE+`, `IBAN+`, `BIC+`, ISO timestamps) or track it as a follow-up issue before #24 starts recording tokens.
+- NEEDS-HUMAN [human] — `src/autobook/pipeline/profiles/sepa.toml:16-34` repeats the `default` rules because profiles have no include. A user's `default.toml` override therefore does not reach accounts mapped to `sepa`. Concrete case: a user overrides `default` to keep digits so that `7 ELEVEN` survives. Unmapped accounts then give `7 ELEVEN`, while the `sepa`-mapped account still gives `ELEVEN` for `SVWZ+7 ELEVEN` (checked). This follows the brief's whole-file-replace rule. The version shows it, so it is not hidden from the gate. But ch.5 describes `sepa` as "`default`, plus …" (`05-building-block-view.md:155-157`), which suggests to users that it inherits from `default`. Decide at sign-off: either document "overriding `default` does not change `sepa`", or add an include mechanism later. The TOML layout is a promise to users, so this is cheaper to settle now.
+- NEEDS-HUMAN [human] — `src/autobook/pipeline/normaliser.py:87,223`: memos are upper-cased before matching, but patterns are compiled as written. A lower-case user rule therefore loads without error and never matches. Concrete case: a user `default.toml` with `pattern = '\bfiliale\b'` loads (version `1-d535a99f4406`), and `Beispielmarkt Filiale` still gives `BEISPIELMARKT FILIALE` (checked). The brief's own principle is "a typo must never silently become a rule that does nothing", but it only requires errors for unknown keys, non-string patterns and patterns that do not compile, and the builder followed that. Closing the gap needs a design choice: compile with `re.IGNORECASE`, or reject patterns with lower-case literals (hard to do reliably because of `\d`, `\b`, `[a-z]`). Either way, the documented format changes.
+
+## Not raised
+
+- Only the five tags are stripped, the date shapes are DD.MM., and `\b\d+\b` turns `7-ELEVEN` into `-ELEVEN` (`default.toml:26`). The brief specifies all of these; only the scope point above is raised. `Normaliser.version` is a mutable plain attribute (`normaliser.py:81`), but I found no caller that could misuse it. A subdirectory named `*.toml` in the user directory is skipped silently: too contrived to raise.
+
+<!-- pdca:leaf-complete -->

@@ -1,0 +1,26 @@
+# Advisory security review — issue 22 / package-skeleton-contracts-fixtures
+
+**Attacker-reachable inputs this diff touches: none in the threat model's "Where untrusted input enters" list (§1–8).** The only new code that reads input is the parser in `autobook.contracts` (the `corpus` and `coa` documents). The book exporter writes those documents from the user's own book, which the threat model lists as **trusted** (the user's booking history and the live chart of accounts). No statement file, plugin output, FITID, model output, rule pack, review file, paperless metadata or downloaded original reaches any line in this patch. The 18 building-block modules (`src/autobook/book/*`, `src/autobook/pipeline/*`, `src/autobook/staging.py`) are inert stubs. Each one only imports `__future__` and raises `NotImplementedError`. None imports `gnucash`, opens a session, writes, logs or touches the network.
+
+The T2-threat-model gate is UNVERIFIABLE (`gate-logs/T2-threat-model.log`) because the new stub paths match security-relevant patterns. Nothing in this diff adds an input, moves a trust boundary or changes a must-hold property, so I see no reason to edit `threat_model.md` for it. That is a call for sign-off, and the brief expected it.
+
+## What I checked (no finding unless listed below)
+
+- **Money (integer cents)**: `src/autobook/contracts.py:240-247` `_cents` uses `type(value) is not int`. A float (`12.5`, `1e2`), a bool, and JSON `NaN`/`Infinity` (they decode to float) are all rejected with `ContractError`. I confirmed `"amount_cents": 1e2` gives `expected an integer, got float`. A 5,000-digit integer hits Python's int-to-string digit limit. `_decode` (`contracts.py:428-432`) turns that `ValueError` into a `ContractError`, so it does not crash. `fraction` uses the same check (`:184`). No float appears anywhere in the fixtures or the builder (`tests/fixtures/synthetic/corpus_builder.py`, `coa.json`).
+- **Version and name gate**: `contracts.py:215-225` rejects `True` and `1.0` as a version because of the `type(...) is int` check. Unknown or missing fields are rejected (`:204-213`).
+- **Account paths**: `_path` (`:256-262`) rejects a bare `str`, so `"Aktiva"` cannot be read as six components. `_components` (`:274-278`) requires a JSON array. Nothing joins or splits a path on a separator. The account `type` is a closed set and is checked as a string first (`:179-181`). This is the fix from iteration 2, and I confirmed it.
+- **Provenance**: only `observed` is accepted (`:142-146`), so a `corrected` row cannot enter through this contract.
+- **Privacy / fixtures**: the merchants are invented (`BEISPIELMARKT`, `NEUHEIM KIOSK`, …). There are no IBAN-shaped strings, and the generator uses a local `random.Random(seed)`. `coa.json` holds only the synthetic tree. `.gitignore:40` adds `*.pdf` inside the financial-data block, above the synthetic un-ignore at `.gitignore:53-54`, so synthetic PDFs stay committable and other PDFs are ignored.
+- **gnucash boundary**: `contracts.py` imports only the standard library (`:31-38`). `tests/test_skeleton.py` checks `sys.modules` for `gnucash`.
+
+## Findings
+
+- NEEDS-HUMAN [impl] — **Low** (on the threat model's scale it is "information in error messages". It would become High, "personal data reaches a log or crash report", only after an exporter bug, so it is an Accident-class cause). `src/autobook/contracts.py:135`, `:144`, `:181`, `:219`, `:286`, `:290` put the rejected value into the `ContractError` text with `!r`. `:212` does the same for unknown key names. The input is the `corpus` document, written by the book process (trusted source). If a future exporter misplaces a column, for example putting the memo where `sign` belongs, the raw memo ends up in an exception message, which a caller will typically log or print. Reproducer (synthetic): a corpus row with `"sign": "BEISPIELMARKT KARTE 1234"` raises `corpus.rows[0].sign: expected one of ['out', 'in'], got 'BEISPIELMARKT KARTE 1234'` (I ran this against the patched module). The fix is cheap and stays in scope: report the type and length, or a fixed placeholder, instead of the value. `!r` on values that are always closed-set constants is fine. Optional: the contract has no logging today, and this is a pattern guard for the `existing`/`apply-in`/`apply-out` contracts that will copy it (#35, #37), not a live leak.
+
+### Noted, not filed (trusted-source input; outside the threat model's rating)
+
+- `json.loads` keeps the last of two duplicate keys. `{"amount_cents": 5, "amount_cents": 500}` parses as `500` without any error. A deeply nested document (`"[" * 100000`) raises `RecursionError` from `_decode` (`:430`), not `ContractError`. Both need a malformed document from the book process, which the threat model trusts. They matter only if a later contract (for example `apply-in`, which carries review decisions) is ever fed from a less trusted writer. If so, add `object_pairs_hook` duplicate rejection there. No action for this patch.
+
+The security-relevant tests cover the hostile cases that matter for this slice, not just the friendly path: float and bool cents, a wrong version, a str path, and bad `type` values (in `tests/test_contracts.py`). No finding there.
+
+<!-- pdca:leaf-complete -->

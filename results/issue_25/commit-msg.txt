@@ -1,0 +1,26 @@
+feat(trial): rolling-origin backtest of the classifier, with a CLI
+
+Build step 2 is decided on how well the kNN classifier does on a real
+book. A leave-one-out score lets every row's own future vote for it, so
+it looks best exactly where the classifier is weakest: merchants seen for
+the first time. This adds the backtest that the decision is made on.
+
+`python -m autobook.pipeline.trial backtest --corpus <file> --out <file>
+--max-distance <x> --min-margin <y>` reads a corpus export and writes a
+JSON report. Each calendar month after the first is classified using only
+rows dated before that month starts, as production would. The report
+gives precision and coverage for the gated kNN and for a token-Bayes
+negative control, split into memos seen before and novel memos, and by
+confidence band. A threshold sweep is run on the novel memos only, since
+that is where confident errors happen. Leave-one-out is kept, labelled as
+an upper bound only.
+
+The report holds counts, rates, versions, thresholds and months only: no
+memo, merchant, account name, amount or day. Error messages name at most
+the corpus field or threshold that was refused, never the value or a
+profile path. The report is evidence; it sets no threshold.
+
+Architecture ch.5 (trial tooling) and ch.6 (the command line) are updated.
+Per-cluster results are deferred to the rule builder.
+
+Fixes #25

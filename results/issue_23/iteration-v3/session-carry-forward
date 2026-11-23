@@ -1,0 +1,6 @@
+Rejected because the brief's `sepa` profile is too narrow. The code follows the brief, but the brief needs fixing before #24 starts storing tokens. Re-plan:
+- Widen the SEPA tag set. Recognise at least KREF+, ABWE+, IBAN+, BIC+ and DEBT+, both as fields to handle and as the end of the previous tag's value. Today `EREF+1 ABWE+MUSTER` swallows everything to the end of the memo, and an IBAN or payee name can end up in the token.
+- Rethink removing CRED+ (creditor ID) and ABWA+ values completely. Two different creditors currently give the same token (e.g. `MITGLIEDSBEITRAG .`). Keep whatever tells merchants apart, or record why not.
+- Strip card-payment timestamps (ISO date/time in SVWZ+), so the token stays the same from one payment to the next.
+Also settle in the brief: whether `sepa` inherits user overrides of `default` (or at least document that it doesn't), and whether user patterns match case-insensitively. Python Unicode version in the version string: optional.
+Already settled, keep as is: prior art is clear (no overlapping or rejected work), the base is 76bacce (#22 merged), and the version-string contract and TOML layouts in the current brief are fine.

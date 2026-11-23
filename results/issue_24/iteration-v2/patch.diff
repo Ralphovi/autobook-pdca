@@ -1,0 +1,897 @@
+diff --git a/docs/design/architecture/05-building-block-view.md b/docs/design/architecture/05-building-block-view.md
+index 734c2f2..36099a0 100644
+--- a/docs/design/architecture/05-building-block-view.md
++++ b/docs/design/architecture/05-building-block-view.md
+@@ -339,6 +339,42 @@ builder reports conflicts between any two tiers on historical rows.
+   only if the **nearest-neighbour distance** is under its cutoff **and** the
+   **vote margin** clears its threshold. Corpus rows are tagged `observed` or
+   `corrected`; nothing else can enter.
++
++  In `autobook.pipeline.classifier`: `index_rows(corpus, normaliser)` turns a
++  corpus into `IndexRow`s (one `observed` row each, token and
++  `normaliser_version` from `Normaliser.normalise`);
++  `KnnIndex.build(rows, *, max_distance, min_margin, half_life_days=HALF_LIFE_DAYS)`
++  fits one `TfidfVectorizer` and one brute-force cosine `NearestNeighbors` per
++  `(source_account, sign)`; `KnnIndex.query(token, source_account, sign, *, as_of,
++  normaliser_version, exclude=None)` returns a `KnnResult` (`account`,
++  `candidate`, `nearest_distance`, `margin`, `share`, `failed_gates`, and
++  `accepted`). A query never sees another partition.
++  - *Vote.* The `k = min(15, rows in the partition)` nearest neighbours vote.
++    Distance is clamped to `[0, 1]`. A neighbour's weight is
++    `(1 - distance) * 0.5 ** (age_days / half_life_days)`, with
++    `age_days = max(0, (as_of - post_date).days)` and `HALF_LIFE_DAYS = 548`
++    (18 months). An account's *share* is its weight over the total weight; the
++    candidate is the account with the largest share (on an exact tie, the smaller
++    path tuple); *margin* is `share(candidate) - share(runner-up)`, with a runner-up
++    of `0` when only one account voted and a margin of `0` when the total weight
++    is `0`.
++  - *Gates.* Distance passes iff `nearest_distance <= max_distance`; margin passes
++    iff `margin >= min_margin`. Both are evaluated and every failure is listed in
++    `failed_gates`; `account` is set only when the set is empty. A partition with
++    no rows, or an empty token, gives `nearest_distance = None` and
++    `{"distance"}`. Thresholds are required, have no default, and are validated
++    (`0 <= max_distance < 1`, `0 < min_margin <= 1`), so a tie is never accepted.
++  - *`exclude`.* Leaves one occurrence of an equal row out of the neighbours (it
++    asks for `k + 1` and drops the first match), so a leave-one-out measurement
++    does not rebuild the index per row. If nothing is left, the result is that of
++    an empty partition.
++  - *Provenance and version.* `IndexRow` refuses any provenance but `observed` or
++    `corrected` when built, and `build` checks every row again (and takes only
++    `IndexRow` itself, not a subclass, so the check cannot be overridden); both
++    raise `KnnError`, and no partial index exists. One index holds one
++    `normaliser_version` (`build` raises on a mix; `query` raises on a version
++    other than the index's). The index is rebuilt every run and never persisted,
++    so it has no version of its own yet; that arrives with the version tuple.
+ - **LLM tail.** Through the model adapter only. The label space is the live
+   account list, minus placeholder accounts and Equity and Trading account types;
+   output outside it is rejected. Temperature is pinned to 0, and the model ID is
+diff --git a/docs/design/architecture/08-crosscutting-concepts.md b/docs/design/architecture/08-crosscutting-concepts.md
+index e8cde1b..f7ea57a 100644
+--- a/docs/design/architecture/08-crosscutting-concepts.md
++++ b/docs/design/architecture/08-crosscutting-concepts.md
+@@ -66,8 +66,8 @@ versions that produced it.
+ 
+ **The corpus has provenance.** Rows are `observed` (from the book export, which
+ yields nothing else) or `corrected` (review decisions, read from staging).
+-Index construction filters on provenance; there is no path by which a synthetic
+-row can enter.
++Index construction refuses (raises on) any row that is not `observed` or
++`corrected`; there is no path by which a synthetic row can enter.
+ 
+ **Thresholds have evidence.** Distance cutoffs, vote margins, confidence bands
+ and the bill-matching window are set from rolling-origin backtest and
+diff --git a/pyproject.toml b/pyproject.toml
+index a9e8ed3..5971092 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -22,12 +22,13 @@ classifiers = [
+     "Programming Language :: Python :: 3",
+     "Topic :: Office/Business :: Financial :: Accounting",
+ ]
+-# Deliberately empty. The pipeline's runtime dependencies (scikit-learn,
+-# ofxstatement, …) land with the code that needs them — build order step 2 —
+-# rather than being declared speculatively. The book process's dependency,
++# scikit-learn is the kNN tier's index (character n-gram TF-IDF and cosine nearest
++# neighbours, ch.5 section 5.2); it is the first runtime dependency, with build order
++# step 2. The other pipeline dependencies (ofxstatement, …) land with the code that
++# needs them rather than being declared speculatively. The book process's dependency,
+ # python3-gnucash, is a SYSTEM package in dist-packages and is never declared
+ # here; see ADR-0002 and the pipeline/book-process boundary in AGENTS.md.
+-dependencies = []
++dependencies = ["scikit-learn>=1.5"]
+ 
+ [project.urls]
+ Homepage = "https://github.com/Ralphovi/autobook"
+@@ -97,6 +98,21 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+ module = ["gnucash.*"]
+ ignore_missing_imports = true
+ 
++[[tool.mypy.overrides]]
++# scikit-learn ships no `py.typed` marker, so mypy sees no types for it.
++module = ["sklearn.*"]
++ignore_missing_imports = true
++
++[[tool.mypy.overrides]]
++# numpy arrives with scikit-learn. Its stubs use the 3.12 `type X = ...` statement,
++# which mypy refuses while it checks for 3.11 (`python_version` above), so mypy
++# must not parse them. Nothing here imports numpy; pytest reaches it (its
++# `approx` names `numpy.ndarray`). numpy's types are `.pyi` stubs, which mypy
++# follows regardless of `follow_imports` unless `follow_imports_for_stubs` is set.
++module = ["numpy", "numpy.*"]
++follow_imports = "skip"
++follow_imports_for_stubs = true
++
+ # ---------------------------------------------------------------------------
+ [tool.pytest.ini_options]
+ minversion = "8.0"
+diff --git a/src/autobook/pipeline/classifier.py b/src/autobook/pipeline/classifier.py
+index ef307d4..d7f552e 100644
+--- a/src/autobook/pipeline/classifier.py
++++ b/src/autobook/pipeline/classifier.py
+@@ -2,15 +2,346 @@
+ 
+ Design: `docs/design/architecture/05-building-block-view.md`.
+ 
+-Stub: the entry point exists so later build steps have a symbol to change; it
+-has no behaviour yet.
++This module holds the kNN tier (tier 5 of the cascade): a character n-gram TF-IDF
++nearest-neighbour index per ``(source_account, sign)`` over the user's own history.
++:meth:`KnnIndex.query` proposes one destination account only when both gates pass:
++the nearest neighbour is close enough, and the recency-weighted vote has a clear
++winner. Otherwise it abstains and says which gate failed. Thresholds have no default:
++they come from backtest evidence, never from code (AGENTS.md).
++
++Only ``observed`` and ``corrected`` rows can enter an index, all normalised under one
++normaliser version. Refusal is an error (:class:`KnnError`), never a silent skip.
++
++``classify`` is still the stub: the cascade itself arrives with a later build step.
+ 
+ Pipeline module: must never import `gnucash`.
+ """
+ 
+ from __future__ import annotations
+ 
+-__all__ = ["classify"]
++import datetime
++import math
++from collections.abc import Iterable
++from dataclasses import dataclass
++from typing import Any, Final, Literal, NoReturn
++
++from sklearn.feature_extraction.text import TfidfVectorizer
++from sklearn.neighbors import NearestNeighbors
++
++from autobook.contracts import CorpusContract, Sign
++from autobook.pipeline.normaliser import Normaliser
++
++__all__ = [
++    "HALF_LIFE_DAYS",
++    "IndexRow",
++    "KnnError",
++    "KnnIndex",
++    "KnnResult",
++    "classify",
++    "index_rows",
++]
++
++# ch.5: "~18-month half-life". 18 months of 365/12 days, rounded: 547.5 -> 548.
++HALF_LIFE_DAYS: Final[float] = 548.0
++
++# Neighbours that vote. A partition smaller than this votes with all of its rows.
++_K: Final = 15
++
++_SIGNS: Final[tuple[str, ...]] = ("out", "in")
++_PROVENANCE: Final[tuple[str, ...]] = ("observed", "corrected")
++
++Gate = Literal["distance", "margin"]
++_Account = tuple[str, ...]
++
++
++class KnnError(ValueError):
++    """A row, a threshold or a query was not accepted by the kNN index.
++
++    Messages name the field, never the memo token or the account path: both are
++    personal data (ch.8 section 8.5).
++    """
++
++
++def _fail(where: str, message: str) -> NoReturn:
++    raise KnnError(f"{where}: {message}")
++
++
++def _text(value: object, where: str, *, non_empty: bool) -> None:
++    # Typed `object` so the runtime check is not dead code to the type checker.
++    if not isinstance(value, str):
++        _fail(where, f"expected a string, got {type(value).__name__}")
++    if non_empty and not value:
++        _fail(where, "must not be empty")
++
++
++def _path(value: object, where: str) -> None:
++    if (
++        not isinstance(value, tuple)
++        or not value
++        or not all(isinstance(part, str) and part for part in value)
++    ):
++        _fail(where, "an account is a non-empty tuple of non-empty path components")
++
++
++@dataclass(frozen=True)
++class IndexRow:
++    """One history row as the index sees it: a normalised memo and where it was booked."""
++
++    token: str
++    source_account: tuple[str, ...]
++    sign: Sign
++    destination_account: tuple[str, ...]
++    post_date: datetime.date
++    provenance: Literal["observed", "corrected"]
++    normaliser_version: str
++
++    def __post_init__(self) -> None:
++        _check_row(self)
++
++
++def _check_row(row: IndexRow) -> None:
++    # A module function, not a method: `KnnIndex.build` runs it again on every row
++    # (a row built around the constructor, e.g. `object.__setattr__` on a frozen
++    # instance, must still be refused), and a subclass must not be able to
++    # override the check.
++    _text(row.token, "token", non_empty=False)
++    _path(row.source_account, "source_account")
++    _path(row.destination_account, "destination_account")
++    if row.sign not in _SIGNS:
++        _fail("sign", f"expected one of {list(_SIGNS)}")
++    # datetime is a subclass of date; its subtraction from a date raises TypeError.
++    if type(row.post_date) is not datetime.date:
++        _fail("post_date", f"expected a date, got {type(row.post_date).__name__}")
++    if row.provenance not in _PROVENANCE:
++        _fail(
++            "provenance",
++            f"only {list(_PROVENANCE)} rows can enter the index, got {row.provenance!r}",
++        )
++    _text(row.normaliser_version, "normaliser_version", non_empty=True)
++
++
++@dataclass(frozen=True)
++class KnnResult:
++    """What one query found, whether or not it was accepted.
++
++    ``account`` is set only when both gates passed. ``candidate`` is the vote winner
++    either way, so a review can show it. Both gate numbers are reported when they exist.
++    """
++
++    account: tuple[str, ...] | None
++    candidate: tuple[str, ...] | None
++    nearest_distance: float | None
++    margin: float | None
++    share: float | None
++    failed_gates: frozenset[Gate]
++
++    @property
++    def accepted(self) -> bool:
++        return not self.failed_gates
++
++
++def index_rows(corpus: CorpusContract, normaliser: Normaliser) -> tuple[IndexRow, ...]:
++    """One ``observed`` row per corpus row, normalised by ``normaliser``."""
++    rows: list[IndexRow] = []
++    for row in corpus.rows:
++        memo = normaliser.normalise(row.raw_memo, row.source_account)
++        rows.append(
++            IndexRow(
++                token=memo.token,
++                source_account=row.source_account,
++                sign=row.sign,
++                destination_account=row.destination_account,
++                post_date=row.post_date,
++                provenance="observed",
++                normaliser_version=memo.version,
++            )
++        )
++    return tuple(rows)
++
++
++class _Partition:
++    """The rows of one ``(source_account, sign)`` and the vectors fitted on them."""
++
++    def __init__(self, rows: list[IndexRow]) -> None:
++        self.rows: Final = tuple(rows)
++        tokens = [row.token for row in rows]
++        self._vectoriser: Any = None
++        self._neighbours: Any = None
++        # char_wb pads every word with spaces, so any non-blank token has an n-gram.
++        # All-blank tokens leave an empty vocabulary, which scikit-learn refuses.
++        if any(token.strip() for token in tokens):
++            self._vectoriser = TfidfVectorizer(
++                analyzer="char_wb", ngram_range=(3, 5), sublinear_tf=True
++            )
++            matrix = self._vectoriser.fit_transform(tokens)
++            self._neighbours = NearestNeighbors(metric="cosine", algorithm="brute").fit(matrix)
++
++    def nearest(self, token: str, count: int) -> list[tuple[float, IndexRow]]:
++        """Up to ``count`` rows nearest to ``token``, closest first, distance in [0, 1]."""
++        if self._neighbours is None or not token.strip():
++            return []
++        count = min(count, len(self.rows))
++        distances, positions = self._neighbours.kneighbors(
++            self._vectoriser.transform([token]), n_neighbors=count
++        )
++        return [
++            # scikit-learn can return a tiny negative distance for identical rows
++            # and a value just over 1.
++            (min(1.0, max(0.0, float(distance))), self.rows[int(position)])
++            for distance, position in zip(distances[0], positions[0], strict=True)
++        ]
++
++
++def _threshold(value: object, where: str) -> float:
++    if isinstance(value, bool) or not isinstance(value, int | float):
++        _fail(where, f"expected a number, got {type(value).__name__}")
++    return float(value)
++
++
++class KnnIndex:
++    """Nearest-neighbour index with abstention gates. Built only by :meth:`build`."""
++
++    def __init__(
++        self,
++        partitions: dict[tuple[_Account, str], _Partition],
++        normaliser_version: str | None,
++        max_distance: float,
++        min_margin: float,
++        half_life_days: float,
++    ) -> None:
++        self._partitions: Final = partitions
++        self._normaliser_version: Final = normaliser_version
++        self._max_distance: Final = max_distance
++        self._min_margin: Final = min_margin
++        self._half_life_days: Final = half_life_days
++
++    @classmethod
++    def build(
++        cls,
++        rows: Iterable[IndexRow],
++        *,
++        max_distance: float,
++        min_margin: float,
++        half_life_days: float = HALF_LIFE_DAYS,
++    ) -> KnnIndex:
++        """Fit one sub-index per ``(source_account, sign)``.
++
++        Raises :class:`KnnError`, and returns nothing, for a row that is not
++        ``observed`` or ``corrected`` (checked again here, not only in the
++        constructor), for rows of more than one normaliser version, and for a
++        threshold outside ``0 <= max_distance < 1``, ``0 < min_margin <= 1`` or a
++        half-life that is not a positive finite number.
++        """
++        distance = _threshold(max_distance, "max_distance")
++        margin = _threshold(min_margin, "min_margin")
++        half_life = _threshold(half_life_days, "half_life_days")
++        if not 0 <= distance < 1:
++            _fail("max_distance", "must satisfy 0 <= max_distance < 1")
++        # min_margin > 0 means a tie can never be accepted.
++        if not 0 < margin <= 1:
++            _fail("min_margin", "must satisfy 0 < min_margin <= 1")
++        if not (math.isfinite(half_life) and half_life > 0):
++            _fail("half_life_days", "must be a positive, finite number of days")
++
++        grouped: dict[tuple[_Account, str], list[IndexRow]] = {}
++        versions: set[str] = set()
++        for row in rows:
++            # Exactly IndexRow: a subclass could change how its fields read.
++            if type(row) is not IndexRow:
++                _fail("rows", f"expected IndexRow objects, got {type(row).__name__}")
++            _check_row(row)  # the constructor check can be bypassed
++            versions.add(row.normaliser_version)
++            grouped.setdefault((row.source_account, row.sign), []).append(row)
++        if len(versions) > 1:
++            _fail(
++                "normaliser_version",
++                f"one index holds one normaliser version, got {len(versions)}",
++            )
++        partitions = {key: _Partition(members) for key, members in grouped.items()}
++        version = next(iter(versions), None)
++        return cls(partitions, version, distance, margin, half_life)
++
++    def query(
++        self,
++        token: str,
++        source_account: tuple[str, ...],
++        sign: Sign,
++        *,
++        as_of: datetime.date,
++        normaliser_version: str,
++        exclude: IndexRow | None = None,
++    ) -> KnnResult:
++        """Vote among the neighbours of ``token`` in its ``(source_account, sign)`` partition.
++
++        ``exclude`` leaves one occurrence of an equal row out of the neighbours, for a
++        leave-one-out measurement that must not rebuild the index per row.
++        """
++        if not isinstance(token, str):
++            _fail("token", f"expected a string, got {type(token).__name__}")
++        _path(source_account, "source_account")
++        if sign not in _SIGNS:
++            _fail("sign", f"expected one of {list(_SIGNS)}")
++        if type(as_of) is not datetime.date:
++            _fail("as_of", f"expected a date, got {type(as_of).__name__}")
++        # Exactly IndexRow: a subclass's `__eq__` would run first in `row == exclude`.
++        if exclude is not None and type(exclude) is not IndexRow:
++            _fail("exclude", f"expected an IndexRow, got {type(exclude).__name__}")
++        if self._normaliser_version is not None and normaliser_version != (
++            self._normaliser_version
++        ):
++            _fail(
++                "normaliser_version",
++                "the query was normalised under a different version than the index",
++            )
++
++        neighbours: list[tuple[float, IndexRow]] = []
++        partition = self._partitions.get((source_account, sign))
++        if partition is not None:
++            # One extra, so that dropping `exclude` still leaves k neighbours.
++            neighbours = partition.nearest(token, _K + 1 if exclude is not None else _K)
++        if exclude is not None:
++            for position, (_, row) in enumerate(neighbours):
++                if row == exclude:
++                    del neighbours[position]
++                    break
++        neighbours = neighbours[:_K]
++        if not neighbours:
++            return KnnResult(None, None, None, None, None, frozenset({"distance"}))
++        return self._vote(neighbours, as_of)
++
++    def _vote(
++        self, neighbours: list[tuple[float, IndexRow]], as_of: datetime.date
++    ) -> KnnResult:
++        weights: dict[_Account, float] = {}
++        for distance, row in neighbours:
++            age_days = max(0, (as_of - row.post_date).days)
++            weight = (1.0 - distance) * 0.5 ** (age_days / self._half_life_days)
++            weights[row.destination_account] = (
++                weights.get(row.destination_account, 0.0) + weight
++            )
++        # Largest weight first; on an exact tie the smaller path tuple, so results
++        # are deterministic.
++        ranked = sorted(weights.items(), key=lambda item: (-item[1], item[0]))
++        total = sum(weights.values())
++        candidate, top = ranked[0]
++        runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
++        share = top / total if total > 0 else 0.0
++        margin = (top - runner_up) / total if total > 0 else 0.0
++
++        nearest = neighbours[0][0]
++        failed: set[Gate] = set()
++        if not nearest <= self._max_distance:
++            failed.add("distance")
++        if not margin >= self._min_margin:
++            failed.add("margin")
++        return KnnResult(
++            account=None if failed else candidate,
++            candidate=candidate,
++            nearest_distance=nearest,
++            margin=margin,
++            share=share,
++            failed_gates=frozenset(failed),
++        )
+ 
+ 
+ def classify() -> None:
+diff --git a/tests/test_knn.py b/tests/test_knn.py
+new file mode 100644
+index 0000000..8c23c98
+--- /dev/null
++++ b/tests/test_knn.py
+@@ -0,0 +1,418 @@
++"""The kNN tier of the classifier: two gates, one account, structural provenance (ch.5 5.2).
++
++Every memo, merchant and account here is invented (`tests/fixtures/synthetic`). The
++thresholds are test inputs, not a recommendation: real ones come from the backtest.
++
++Only modules that exist without this change are imported at module scope. Every name
++the change adds is reached through the module object inside a test body, so with the
++change reverted each test runs and fails instead of the file failing to import.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import datetime
++import typing
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from autobook.pipeline import classifier, normaliser
++from tests.fixtures.synthetic import corpus_builder
++
++GIROKONTO = corpus_builder.GIROKONTO
++REVOLUT = corpus_builder.REVOLUT
++LEBENSMITTEL = corpus_builder.LEBENSMITTEL
++MIETE = corpus_builder.MIETE
++
++MAX_DISTANCE = 0.5
++MIN_MARGIN = 0.5
++AS_OF = datetime.date(2025, 12, 28)
++VERSION = "test-1"
++
++
++def _load(directory: Path) -> Any:
++    return normaliser.load(directory)
++
++
++def _history(directory: Path) -> tuple[Any, list[Any], datetime.date, Any]:
++    """The normaliser, the index rows dated before the novel row, and its date."""
++    norm = _load(directory)
++    corpus = corpus_builder.build_corpus(0)
++    novel = next(
++        row for row in corpus.rows if row.raw_memo.startswith(corpus_builder.NOVEL_MERCHANT)
++    )
++    rows = [
++        row for row in classifier.index_rows(corpus, norm) if row.post_date < novel.post_date
++    ]
++    return norm, rows, novel.post_date, novel
++
++
++def _fixture_index(directory: Path) -> tuple[Any, Any, datetime.date, Any]:
++    norm, rows, as_of, novel = _history(directory)
++    index = classifier.KnnIndex.build(rows, max_distance=MAX_DISTANCE, min_margin=MIN_MARGIN)
++    return norm, index, as_of, novel
++
++
++def _row(
++    token: str,
++    destination: tuple[str, ...],
++    *,
++    days_before: int = 0,
++    source: tuple[str, ...] = GIROKONTO,
++    sign: str = "out",
++    provenance: str = "observed",
++    version: str = VERSION,
++) -> Any:
++    return classifier.IndexRow(
++        token=token,
++        source_account=source,
++        sign=sign,  # type: ignore[arg-type]
++        destination_account=destination,
++        post_date=AS_OF - datetime.timedelta(days=days_before),
++        provenance=provenance,  # type: ignore[arg-type]
++        normaliser_version=version,
++    )
++
++
++def _build(rows: list[Any], **overrides: Any) -> Any:
++    options: dict[str, Any] = {"max_distance": MAX_DISTANCE, "min_margin": MIN_MARGIN}
++    options.update(overrides)
++    return classifier.KnnIndex.build(rows, **options)
++
++
++def _query(index: Any, token: str, **overrides: Any) -> Any:
++    options: dict[str, Any] = {"as_of": AS_OF, "normaliser_version": VERSION}
++    options.update(overrides)
++    return index.query(
++        token, options.pop("source", GIROKONTO), options.pop("sign", "out"), **options
++    )
++
++
++# --- (a), (b): the fixture history -------------------------------------------------
++
++
++def test_known_merchant_with_card_noise_is_accepted(tmp_path: Path) -> None:
++    norm, index, as_of, _ = _fixture_index(tmp_path)
++    memo = norm.normalise("BEISPIELMARKT KARTE 40711 17.12. SAGT DANKE 5521", GIROKONTO)
++
++    result = index.query(
++        memo.token, GIROKONTO, "out", as_of=as_of, normaliser_version=norm.version
++    )
++
++    assert result.accepted
++    assert result.failed_gates == frozenset()
++    assert result.account == LEBENSMITTEL
++    assert result.candidate == LEBENSMITTEL
++    assert result.nearest_distance == pytest.approx(0, abs=1e-6)
++    assert result.margin == pytest.approx(1)
++
++
++def test_novel_merchant_abstains_on_distance(tmp_path: Path) -> None:
++    norm, index, as_of, novel = _fixture_index(tmp_path)
++    memo = norm.normalise(novel.raw_memo, GIROKONTO)
++
++    result = index.query(
++        memo.token, GIROKONTO, "out", as_of=as_of, normaliser_version=norm.version
++    )
++
++    assert not result.accepted
++    assert result.account is None
++    assert "distance" in result.failed_gates
++    assert result.nearest_distance is not None
++    assert result.nearest_distance > MAX_DISTANCE
++
++
++def test_index_rows_are_observed_and_carry_the_normaliser_version(tmp_path: Path) -> None:
++    norm, rows, _, _ = _history(tmp_path)
++
++    assert rows
++    assert {row.provenance for row in rows} == {"observed"}
++    assert {row.normaliser_version for row in rows} == {norm.version}
++
++
++# --- (c): a split vote -------------------------------------------------------------
++
++
++def test_split_vote_abstains_on_margin_only() -> None:
++    rows = [_row("NEUBAU DROGERIE", LEBENSMITTEL, days_before=day) for day in (5, 40, 90)]
++    rows += [_row("NEUBAU DROGERIE", MIETE, days_before=day) for day in (5, 40, 90)]
++    index = _build(rows)
++
++    result = _query(index, "NEUBAU DROGERIE")
++
++    assert result.failed_gates == frozenset({"margin"})
++    assert result.account is None
++    assert result.margin == pytest.approx(0)
++    assert result.share == pytest.approx(0.5)
++    assert result.nearest_distance == pytest.approx(0, abs=1e-6)
++
++
++def test_exact_tie_names_the_smaller_path_as_candidate() -> None:
++    rows = [_row("NEUBAU DROGERIE", MIETE), _row("NEUBAU DROGERIE", LEBENSMITTEL)]
++
++    result = _query(_build(rows), "NEUBAU DROGERIE")
++
++    assert result.candidate == LEBENSMITTEL
++    assert result.account is None
++
++
++# --- (d): provenance is refused at two points --------------------------------------
++
++
++def test_synthetic_provenance_is_refused_by_the_row_constructor() -> None:
++    with pytest.raises(classifier.KnnError):
++        _row("BEISPIELMARKT", LEBENSMITTEL, provenance="synthetic")
++
++
++def test_synthetic_provenance_is_refused_by_build() -> None:
++    good = _row("BEISPIELMARKT", LEBENSMITTEL)
++    smuggled = _row("MUSTERBAECKEREI", LEBENSMITTEL)
++    object.__setattr__(smuggled, "provenance", "synthetic")
++
++    with pytest.raises(classifier.KnnError):
++        _build([good, smuggled])
++
++
++def test_a_subclass_cannot_switch_off_the_build_check() -> None:
++    # Skips the constructor check and offers a do-nothing validator in case `build`
++    # looks one up on the row.
++    class Lenient(classifier.IndexRow):
++        def __post_init__(self) -> None:
++            pass
++
++        def _validate(self) -> None:
++            pass
++
++    fields = dataclasses.asdict(_row("MUSTERBAECKEREI", LEBENSMITTEL))
++    smuggled = Lenient(**{**fields, "provenance": "synthetic"})
++    assert dataclasses.asdict(smuggled)["provenance"] == "synthetic"
++
++    with pytest.raises(classifier.KnnError):
++        _build([_row("BEISPIELMARKT", LEBENSMITTEL), smuggled])
++
++
++def test_corrected_rows_are_accepted() -> None:
++    index = _build([_row("BEISPIELMARKT", LEBENSMITTEL, provenance="corrected")])
++
++    assert _query(index, "BEISPIELMARKT").account == LEBENSMITTEL
++
++
++# --- (e): an empty partition -------------------------------------------------------
++
++
++def test_partition_with_no_rows_abstains_on_distance(tmp_path: Path) -> None:
++    norm, index, as_of, _ = _fixture_index(tmp_path)
++
++    result = index.query(
++        "TESTHOF GEMUESE",
++        REVOLUT,
++        "in",
++        as_of=as_of,
++        normaliser_version=norm.version,
++    )
++
++    assert result.failed_gates == frozenset({"distance"})
++    assert result.nearest_distance is None
++    assert result.account is None
++    assert result.candidate is None
++
++
++def test_a_query_never_sees_another_partition() -> None:
++    index = _build([_row("BEISPIELMARKT", LEBENSMITTEL, source=GIROKONTO)])
++
++    other_source = _query(index, "BEISPIELMARKT", source=REVOLUT)
++    other_sign = _query(index, "BEISPIELMARKT", sign="in")
++
++    for result in (other_source, other_sign):
++        assert result.failed_gates == frozenset({"distance"})
++        assert result.nearest_distance is None
++
++
++def test_empty_token_abstains_on_distance() -> None:
++    index = _build([_row("BEISPIELMARKT", LEBENSMITTEL)])
++
++    result = _query(index, "")
++
++    assert result.failed_gates == frozenset({"distance"})
++    assert result.nearest_distance is None
++
++
++def test_index_of_empty_tokens_builds_and_abstains() -> None:
++    index = _build([_row("", LEBENSMITTEL)])
++
++    result = _query(index, "BEISPIELMARKT")
++
++    assert result.failed_gates == frozenset({"distance"})
++
++
++# --- (f): one normaliser version ---------------------------------------------------
++
++
++def test_build_refuses_two_normaliser_versions() -> None:
++    rows = [
++        _row("BEISPIELMARKT", LEBENSMITTEL, version="v1"),
++        _row("BEISPIELMARKT", LEBENSMITTEL, version="v2"),
++    ]
++
++    with pytest.raises(classifier.KnnError):
++        _build(rows)
++
++
++def test_query_refuses_another_normaliser_version() -> None:
++    index = _build([_row("BEISPIELMARKT", LEBENSMITTEL)])
++
++    with pytest.raises(classifier.KnnError):
++        _query(index, "BEISPIELMARKT", normaliser_version="other")
++
++
++# --- (g): thresholds ---------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "overrides",
++    [
++        {"max_distance": 1.0},
++        {"max_distance": -0.1},
++        {"min_margin": 0.0},
++        {"min_margin": 1.5},
++    ],
++)
++def test_build_refuses_a_threshold_out_of_range(overrides: dict[str, float]) -> None:
++    with pytest.raises(classifier.KnnError):
++        _build([_row("BEISPIELMARKT", LEBENSMITTEL)], **overrides)
++
++
++def test_thresholds_have_no_default() -> None:
++    with pytest.raises(TypeError):
++        classifier.KnnIndex.build([_row("BEISPIELMARKT", LEBENSMITTEL)])  # type: ignore[call-arg]
++
++
++@pytest.mark.parametrize("half_life", [0.0, -1.0, float("inf"), float("nan")])
++def test_build_refuses_a_half_life_that_is_not_positive_and_finite(half_life: float) -> None:
++    with pytest.raises(classifier.KnnError):
++        _build([_row("BEISPIELMARKT", LEBENSMITTEL)], half_life_days=half_life)
++
++
++def test_boundary_thresholds_are_accepted() -> None:
++    index = _build([_row("BEISPIELMARKT", LEBENSMITTEL)], max_distance=0.0, min_margin=1.0)
++
++    result = _query(index, "BEISPIELMARKT")
++
++    assert result.accepted
++    assert result.account == LEBENSMITTEL
++
++
++# --- (h): recency ------------------------------------------------------------------
++
++
++def test_recent_habit_outvotes_an_older_majority() -> None:
++    rows = [_row("MUSTER VERMIETER", LEBENSMITTEL, days_before=1500) for _ in range(3)]
++    rows += [_row("MUSTER VERMIETER", MIETE, days_before=10) for _ in range(2)]
++
++    result = _query(_build(rows), "MUSTER VERMIETER")
++
++    assert result.candidate == MIETE
++    assert result.share is not None
++    assert result.share > 0.5
++
++
++def test_a_very_long_half_life_restores_the_count() -> None:
++    rows = [_row("MUSTER VERMIETER", LEBENSMITTEL, days_before=1500) for _ in range(3)]
++    rows += [_row("MUSTER VERMIETER", MIETE, days_before=10) for _ in range(2)]
++
++    result = _query(_build(rows, half_life_days=1e9), "MUSTER VERMIETER")
++
++    assert result.candidate == LEBENSMITTEL
++
++
++# --- (i): exclude ------------------------------------------------------------------
++
++
++def test_exclude_leaves_out_exactly_one_equal_row() -> None:
++    repeated = _row("MUSTER VERMIETER", LEBENSMITTEL)
++    other = _row("MUSTER VERMIETER", MIETE)
++    index = _build([repeated, repeated, other])
++
++    result = _query(index, "MUSTER VERMIETER", exclude=repeated)
++
++    assert result.margin == pytest.approx(0)
++    assert result.failed_gates == frozenset({"margin"})
++
++
++def test_exclude_of_the_only_row_leaves_nothing_near() -> None:
++    only = _row("MUSTER VERMIETER", LEBENSMITTEL)
++    index = _build([only])
++
++    result = _query(index, "MUSTER VERMIETER", exclude=only)
++
++    assert result.nearest_distance is None
++    assert result.failed_gates == frozenset({"distance"})
++
++
++def test_exclude_keeps_k_neighbours_when_the_partition_is_larger() -> None:
++    # 20 identical votes for one account and one for another: with the excluded row
++    # dropped the vote still has 15 neighbours, all for the same account.
++    rows = [_row("MUSTER VERMIETER", LEBENSMITTEL) for _ in range(20)]
++    index = _build(rows)
++
++    result = _query(index, "MUSTER VERMIETER", exclude=rows[0])
++
++    assert result.accepted
++    assert result.account == LEBENSMITTEL
++
++
++# --- malformed input ---------------------------------------------------------------
++
++
++def test_malformed_rows_are_refused() -> None:
++    with pytest.raises(classifier.KnnError):
++        _row("BEISPIELMARKT", ())
++    with pytest.raises(classifier.KnnError):
++        _row("BEISPIELMARKT", LEBENSMITTEL, sign="sideways")
++    with pytest.raises(classifier.KnnError):
++        _row("BEISPIELMARKT", LEBENSMITTEL, version="")
++    with pytest.raises(classifier.KnnError):
++        _build(["not a row"])
++
++
++def test_a_refused_row_message_does_not_carry_the_token() -> None:
++    with pytest.raises(classifier.KnnError) as caught:
++        _row("PERSOENLICHER EMPFAENGER", LEBENSMITTEL, provenance="synthetic")
++
++    assert "PERSOENLICHER" not in str(caught.value)
++
++
++def test_the_result_holds_one_account_path_and_no_split_type_exists() -> None:
++    # Splits are rules-tier only: the result has one `account` field holding one path,
++    # and the module exports nothing else that could carry a split.
++    hints = typing.get_type_hints(classifier.KnnResult)
++    assert [field.name for field in dataclasses.fields(classifier.KnnResult)] == [
++        "account",
++        "candidate",
++        "nearest_distance",
++        "margin",
++        "share",
++        "failed_gates",
++    ]
++    assert hints["account"] == tuple[str, ...] | None
++    assert set(classifier.__all__) == {
++        "HALF_LIFE_DAYS",
++        "IndexRow",
++        "KnnError",
++        "KnnIndex",
++        "KnnResult",
++        "classify",
++        "index_rows",
++    }
++
++    result = _query(_build([_row("BEISPIELMARKT", LEBENSMITTEL)]), "BEISPIELMARKT")
++
++    assert result.account == LEBENSMITTEL
++    assert all(isinstance(part, str) for part in result.account)
++
++
++def test_the_cascade_entry_point_is_still_the_stub() -> None:
++    with pytest.raises(NotImplementedError):
++        classifier.classify()
+diff --git a/tests/test_skeleton.py b/tests/test_skeleton.py
+index b0441f8..f786575 100644
+--- a/tests/test_skeleton.py
++++ b/tests/test_skeleton.py
+@@ -19,7 +19,7 @@ import pytest
+ MINIMUM_MODULES = {"autobook.pipeline": 11, "autobook.book": 6}
+ 
+ # Building blocks that export their real API instead of one stub entry point.
+-IMPLEMENTED = {"autobook.pipeline.normaliser"}
++IMPLEMENTED = {"autobook.pipeline.classifier", "autobook.pipeline.normaliser"}
+ 
+ 
+ def _modules(package: str) -> list[str]:

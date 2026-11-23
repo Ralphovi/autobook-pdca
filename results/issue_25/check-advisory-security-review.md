@@ -1,0 +1,23 @@
+# Security review — issue 25 / rolling-origin backtest
+
+Attacker-reachable inputs this diff touches: the **corpus file** (`--corpus`), whose `raw_memo` fields carry counterparty text (threat model, "Where untrusted input enters" item 1) and whose account paths are personal data. The **normaliser profile directory** (`--normaliser-dir`) is user config, which the threat model trusts. The **thresholds** are typed by the user. The output is the **report file** plus **stderr**. The diff has no book access, no model adapter, no paperless client, no review file and no network, so most "What must hold" properties are out of reach. The ones that apply are "Nothing personal leaves the machine" (logs, crash output) and "a threshold is never lowered" (thresholds stay human-set).
+
+## Findings
+
+No finding.
+
+## What I checked
+
+- **The report holds nothing that identifies a transaction.** `backtest()` (`src/autobook/pipeline/trial.py:329-357`) builds the report from counts, rates, the normaliser version, thresholds from the command line, band labels made from constants, and `YYYY-MM` month labels. No token, memo, account tuple, amount or day reaches it. `_Outcome` (`trial.py:82-93`) holds only bools and floats. Accounts are compared for equality and never written out. The sweep (`trial.py:209-228`) adds only grid constants. `test_cli_writes_a_report_without_identifying_data` (`tests/test_backtest.py:206`) checks the serialised report against every fixture merchant name, every account path part, and day-level dates.
+- **Stderr never quotes the refused value.** `_refused` (`trial.py:423-438`) drops the exception text. It passes on only the leading location, and only if that location fully matches a names-and-digit-indices pattern rooted at a caller-approved name (`corpus`, or the two threshold names). I traced the contract error sites. `_fail`/`_build` in `src/autobook/contracts.py:199-200,274-279` build the location from field names the code supplies plus `[i]` indices. Values (`{text!r}`, unknown field names) only appear after the `": "` split, so a key or value read from the file cannot reach the location part. Normaliser errors are never located (roots `()`, `trial.py:457`), so a profile path the user chose cannot leak. OS errors print only the exception type (`trial.py:460-461,465-466`). Tests at `tests/test_backtest.py:244-320` cover the hostile path: refused values, a memo-like string, and a relative profile path must not show up in stderr, and stderr is exactly one line.
+- **No traceback leaks data from the file.** Every error the corpus file or the thresholds can cause is caught (`ContractError`, `NormaliserError`, `KnnError`, `OSError`, `UnicodeDecodeError`). `--max-distance nan` is refused by `KnnIndex.build` (`src/autobook/pipeline/classifier.py:329-334`; a NaN fails both range checks), and `trial.py:297` checks the thresholds before any data is touched, so `json.dumps(..., allow_nan=False)` (`trial.py:463`) cannot raise on a threshold. Every float inside the report is a count ratio or a constant. Leave-one-out's `exclude=row` cannot hit the "no equal row" error, because each row is in its own index.
+- **No partial report on a refusal.** The report is written only after the whole run succeeds (`trial.py:462-464`). `test_cli_refuses_a_file_that_is_not_a_corpus` and the refusal tests assert `not out.exists()`.
+- **Thresholds stay human-set.** The sweep re-applies the gates to stored results and never feeds back (`trial.py:356`). Nothing in the diff writes a threshold anywhere. Leave-one-out appears only under `upper_bound` (`tests/test_backtest.py:390-401`).
+- **No money path or float on a booking path.** Amounts are not read by this module at all.
+- **Resources:** one index build per month over a history that grows each month, plus one leave-one-out build. The cost scales with the corpus the user exports, not with anything a counterparty controls. This is not a security issue.
+- **Fixtures:** the planted corpora use invented names (`ALPHA`, `BRAVO`, `ZULU KIOSK`, `CHARLIE`) and the synthetic `corpus_builder`. No data from a real statement.
+- **Out of scope here:** a crafted memo that makes the #23 normaliser's regexes slow, and JSON nesting deep enough to cause a `RecursionError` in `corpus_from_json`. Both are in upstream modules this diff does not change.
+
+Gates: C4-ci and C4-verify pass (21 of 26 red without the fix). T2 reports no security-relevant path touched, which matches what I found: the diff is a read-only, offline tool, and its only output channels are the report file and stderr, both checked above.
+
+<!-- pdca:leaf-complete -->

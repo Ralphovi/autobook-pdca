@@ -1,0 +1,11 @@
+{
+  "mode": "stacked-pr",
+  "branch": "enhancement/25-rolling-origin-backtest",
+  "pr_url": "https://github.com/Ralphovi/autobook/pull/52",
+  "base": "main",
+  "repo": "Ralphovi/autobook",
+  "by": "Eduard Ralph",
+  "date": "2026-10-15",
+  "id_pending": false,
+  "stacks_on": []
+}

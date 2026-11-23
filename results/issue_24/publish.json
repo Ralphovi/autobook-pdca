@@ -1,0 +1,11 @@
+{
+  "mode": "stacked-pr",
+  "branch": "enhancement/24-knn-index-abstention-gates",
+  "pr_url": "https://github.com/Ralphovi/autobook/pull/51",
+  "base": "main",
+  "repo": "Ralphovi/autobook",
+  "by": "Eduard Ralph",
+  "date": "2026-10-15",
+  "id_pending": false,
+  "stacks_on": []
+}
